@@ -11,15 +11,18 @@ Open-source CLI runtime for `speq`.
 - produce machine-readable JSON output and stable exit codes;
 - generate Allure-compatible artifacts.
 
-## Planned commands (v1)
+Core runtime is implemented in Rust.
 
-- `speq init`
-- `speq validate`
-- `speq list`
-- `speq run`
-- `speq report`
-- `speq doctor`
-- `speq migrate-layout`
+## Current commands
+
+- `speq init --mode in-repo|test-repo`
+- `speq list [--speq-root <path>] [--format json]`
+- `speq validate [--speq-root <path>] [--format json]`
+- `speq run [--speq-root <path>] [--env <name>] [--test <file>|--suite <dir>] [--tags smoke,api] [--report all|summary|allure] [--output <summary.json>]`
+- `speq report [--speq-root <path>] [--format all|summary|allure] [--summary <summary.json>]`
+- `speq doctor [--speq-root <path>] [--format json]`
+
+`run` report mode defaults to `allure` when `--report` is not set.
 
 ## Repository layout
 
@@ -27,17 +30,22 @@ Open-source CLI runtime for `speq`.
 src/
   cli/
   parser/
-  runner/
-  assertions/
   manifest/
-  env/
-  reporting/
-schemas/
-examples/
 docs/
-tests/
 ```
+
+## Local development
+
+- Build: `cargo build`
+- Test: `cargo test`
+- Validate canonical fixtures:
+  - `cargo run -- validate --speq-root ../speq-examples/in-repo-mode/.speq --format json`
+  - `cargo run -- validate --speq-root ../speq-examples/test-repo-mode --format json`
 
 ## Status
 
-Bootstrap complete. Phase 1 implementation is tracked in `docs/PHASE1_BACKLOG.md`.
+MVP CLI is functionally complete for OSS alpha:
+
+- init/list/validate/run/report/doctor;
+- dual layout support (in-repo/test-repo);
+- report outputs (summary/allure/all) with contract regression tests.
