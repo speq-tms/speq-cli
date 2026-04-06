@@ -1,0 +1,74 @@
+name: mvp-integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  parity-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout speq-cli
+        uses: actions/checkout@v4
+        with:
+          path: speq-cli
+
+      - name: Checkout speq-examples
+        uses: actions/checkout@v4
+        with:
+          repository: stepankaziatko/speq-examples
+          path: speq-examples
+
+      - name: Checkout speq-github-runner
+        uses: actions/checkout@v4
+        with:
+          repository: stepankaziatko/speq-github-runner
+          path: speq-github-runner
+
+      - name: Checkout speq-vscode-extension
+        uses: actions/checkout@v4
+        with:
+          repository: stepankaziatko/speq-vscode-extension
+          path: speq-vscode-extension
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build and install speq binary
+        run: |
+          cargo install --path speq-cli --root "$RUNNER_TEMP/speq-bin" --locked || cargo install --path speq-cli --root "$RUNNER_TEMP/speq-bin" --force
+          echo "$RUNNER_TEMP/speq-bin/bin" >> "$GITHUB_PATH"
+
+      - name: CLI parity on canonical fixtures
+        run: |
+          speq validate --speq-root speq-examples/in-repo-mode/.speq --format json
+          speq validate --speq-root speq-examples/test-repo-mode --format json
+          speq run --speq-root speq-examples/in-repo-mode/.speq --env ci --report summary --output "$RUNNER_TEMP/summary.json"
+          speq report --speq-root speq-examples/in-repo-mode/.speq --format allure --summary "$RUNNER_TEMP/summary.json"
+
+      - name: Runner parity against same fixture
+        run: |
+          export GITHUB_OUTPUT="$RUNNER_TEMP/runner-output.txt"
+          export INPUT_SPEQ_ROOT="speq-examples/in-repo-mode/.speq"
+          export INPUT_ENV="ci"
+          export INPUT_TEST=""
+          export INPUT_SUITE="suites"
+          export INPUT_TAGS="smoke"
+          export INPUT_SKIP_VALIDATE="false"
+          export INPUT_SUMMARY_OUTPUT="$RUNNER_TEMP/runner-summary.json"
+          export INPUT_LOGS_OUTPUT="$RUNNER_TEMP/runner.log"
+          bash speq-github-runner/scripts/run_mode.sh
+          test -f "$RUNNER_TEMP/runner-summary.json"
+          test -f "$RUNNER_TEMP/runner.log"
+
+      - name: Extension build parity
+        run: |
+          cd speq-vscode-extension
+          npm ci
+          npm run check
