@@ -1,0 +1,15 @@
+id: "smoke.health"
+title: "Health endpoint smoke test"
+tags:
+  - smoke
+  - api
+variables:
+  targetPath: "/status/200"
+steps:
+  - type: api
+    name: "GET health"
+    method: GET
+    url: "{{targetPath}}"
+    assert:
+      - type: status
+        expected: 200

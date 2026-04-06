@@ -1,0 +1,13 @@
+id: "smoke.root-layout"
+title: "Root layout smoke test"
+tags:
+  - smoke
+  - api
+steps:
+  - type: api
+    name: "GET root health"
+    method: GET
+    url: "/status/200"
+    assert:
+      - type: status
+        expected: 200

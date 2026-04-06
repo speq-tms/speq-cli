@@ -1,0 +1,6 @@
+version: "1"
+project: "sample-service"
+defaultEnvironment: "ci"
+environmentsDir: "environments"
+suitesDir: "suites"
+reportsDir: "reports"

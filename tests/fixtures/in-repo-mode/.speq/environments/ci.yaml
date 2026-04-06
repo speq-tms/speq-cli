@@ -1,0 +1,4 @@
+name: ci
+baseUrl: https://httpbin.org
+headers:
+  x-source: speq-cli-fixtures

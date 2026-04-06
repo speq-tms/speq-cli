@@ -11,5 +11,5 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --locked || cargo build
       - run: cargo test --locked || cargo test
-      - run: cargo run --locked -- validate --speq-root ../speq-examples/in-repo-mode/.speq --format json || cargo run -- validate --speq-root ../speq-examples/in-repo-mode/.speq --format json
-      - run: cargo run --locked -- doctor --speq-root ../speq-examples/test-repo-mode --format json || cargo run -- doctor --speq-root ../speq-examples/test-repo-mode --format json
+      - run: cargo run --locked -- validate --speq-root tests/fixtures/in-repo-mode/.speq --format json || cargo run -- validate --speq-root tests/fixtures/in-repo-mode/.speq --format json
+      - run: cargo run --locked -- doctor --speq-root tests/fixtures/test-repo-mode --format json || cargo run -- doctor --speq-root tests/fixtures/test-repo-mode --format json
