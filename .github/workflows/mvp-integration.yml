@@ -17,19 +17,19 @@ jobs:
       - name: Checkout speq-examples
         uses: actions/checkout@v4
         with:
-          repository: stepankaziatko/speq-examples
+          repository: speq-tms/speq-examples
           path: speq-examples
 
       - name: Checkout speq-github-runner
         uses: actions/checkout@v4
         with:
-          repository: stepankaziatko/speq-github-runner
+          repository: speq-tms/speq-github-runner
           path: speq-github-runner
 
       - name: Checkout speq-vscode-extension
         uses: actions/checkout@v4
         with:
-          repository: stepankaziatko/speq-vscode-extension
+          repository: speq-tms/speq-vscode-extension
           path: speq-vscode-extension
 
       - name: Setup Rust

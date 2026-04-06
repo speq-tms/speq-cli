@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[test]
 fn summary_report_matches_results_v1_schema() {
     let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../speq-contracts/schemas/results/v1.json");
+        .join("tests/fixtures/contracts/results/v1.json");
     let schema_raw = fs::read_to_string(&schema_path).expect("read results schema");
     let schema_json: Value = serde_json::from_str(&schema_raw).expect("parse results schema");
 
