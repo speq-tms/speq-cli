@@ -42,6 +42,24 @@ docs/
   - `cargo run -- validate --speq-root ../speq-examples/in-repo-mode/.speq --format json`
   - `cargo run -- validate --speq-root ../speq-examples/test-repo-mode --format json`
 
+## Installation (Homebrew)
+
+```bash
+brew tap speq-tms/tap https://github.com/speq-tms/homebrew-tap
+brew install speq
+```
+
+## Release packaging
+
+Tag-driven release assets are built by `.github/workflows/release.yml`:
+
+- `speq-linux-x86_64.tar.gz`
+- `speq-darwin-x86_64.tar.gz`
+- `speq-darwin-aarch64.tar.gz`
+- matching `.sha256` files for each archive
+
+Homebrew formula updates are documented in `docs/HOMEBREW_RELEASE.md`.
+
 ## Status
 
 MVP CLI is functionally complete for OSS alpha:
