@@ -101,6 +101,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.value }}
           PRERELEASE: ${{ inputs.prerelease }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -109,6 +110,7 @@ jobs:
             args+=(--prerelease)
           fi
           gh release create "$TAG" \
+            -R "$REPO" \
             dist/speq-*.tar.gz \
             dist/speq-*.tar.gz.sha256 \
             --title "speq-cli $TAG" \
