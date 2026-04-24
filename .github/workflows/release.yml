@@ -117,3 +117,17 @@ jobs:
             --generate-notes \
             "${args[@]}"
 
+      - name: Trigger homebrew tap formula update
+        if: ${{ secrets.HOMEBREW_TAP_PAT != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+          TAG: ${{ steps.tag.outputs.value }}
+          TAP_REPO: speq-tms/homebrew-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/${TAP_REPO}/dispatches" \
+            -f event_type='speq-cli-release' \
+            -f "client_payload[tag]=${TAG}" \
+            -f "client_payload[source_repo]=${GITHUB_REPOSITORY}"
+
