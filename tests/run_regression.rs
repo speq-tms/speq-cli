@@ -76,6 +76,7 @@ fn selected_files_works_for_suite_directory() {
     fs::create_dir_all(&suites).expect("create suites");
     fs::write(suites.join("a.yaml"), "id: t1\ntitle: t1\nsteps: []\n").expect("write");
     fs::write(suites.join("b.yml"), "id: t2\ntitle: t2\nsteps: []\n").expect("write");
+    fs::write(suites.join("init.yaml"), "suite:\n  beforeEach: []\n").expect("write");
     fs::write(suites.join("ignore.txt"), "x").expect("write");
 
     let files = collect_selected_files(&tmp, "suites", None, Some("suites".to_string())).expect("files");

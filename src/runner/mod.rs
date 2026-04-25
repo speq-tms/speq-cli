@@ -10,12 +10,49 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HttpRequestInfo {
+    pub method: String,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpResponseInfo {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertionRunResult {
+    #[serde(rename = "type")]
+    pub assertion_type: String,
+    pub status: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StepRunResult {
     pub name: String,
     pub status: String,
     pub message: String,
     pub response_status: Option<u16>,
     pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<HttpRequestInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<HttpResponseInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<AssertionRunResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +66,10 @@ pub struct TestRunResult {
     pub duration_ms: u128,
     pub errors: Vec<String>,
     pub steps: Vec<StepRunResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_steps: Vec<StepRunResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teardown_steps: Vec<StepRunResult>,
 }
 
 fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
@@ -72,7 +113,8 @@ fn json_path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<String> {
+fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> (Vec<AssertionRunResult>, Vec<String>) {
+    let mut details = Vec::new();
     let mut errors = Vec::new();
     let parsed_json = serde_json::from_str::<Value>(body).ok();
 
@@ -85,10 +127,26 @@ fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<Stri
                     .and_then(Value::as_u64)
                     .map(|v| v as u16);
                 if expected != Some(status) {
-                    errors.push(format!(
+                    let message = format!(
                         "status assertion failed: expected {:?}, got {}",
                         expected, status
-                    ));
+                    );
+                    errors.push(message.clone());
+                    details.push(AssertionRunResult {
+                        assertion_type: "status".to_string(),
+                        status: "failed".to_string(),
+                        message,
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
+                } else {
+                    details.push(AssertionRunResult {
+                        assertion_type: "status".to_string(),
+                        status: "passed".to_string(),
+                        message: format!("status assertion passed: {}", status),
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
                 }
             }
             "contains" => {
@@ -98,7 +156,23 @@ fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<Stri
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !body.contains(needle) {
-                    errors.push(format!("contains assertion failed: '{}' not found", needle));
+                    let message = format!("contains assertion failed: '{}' not found", needle);
+                    errors.push(message.clone());
+                    details.push(AssertionRunResult {
+                        assertion_type: "contains".to_string(),
+                        status: "failed".to_string(),
+                        message,
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
+                } else {
+                    details.push(AssertionRunResult {
+                        assertion_type: "contains".to_string(),
+                        status: "passed".to_string(),
+                        message: format!("contains assertion passed: '{}'", needle),
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
                 }
             }
             "notcontains" => {
@@ -108,7 +182,23 @@ fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<Stri
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if body.contains(needle) {
-                    errors.push(format!("notcontains assertion failed: '{}' found", needle));
+                    let message = format!("notcontains assertion failed: '{}' found", needle);
+                    errors.push(message.clone());
+                    details.push(AssertionRunResult {
+                        assertion_type: "notcontains".to_string(),
+                        status: "failed".to_string(),
+                        message,
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
+                } else {
+                    details.push(AssertionRunResult {
+                        assertion_type: "notcontains".to_string(),
+                        status: "passed".to_string(),
+                        message: format!("notcontains assertion passed: '{}'", needle),
+                        path: None,
+                        expected: assertion.expected.clone(),
+                    });
                 }
             }
             "regex" => {
@@ -120,18 +210,70 @@ fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<Stri
                 match Regex::new(pattern) {
                     Ok(re) => {
                         if !re.is_match(body) {
-                            errors.push(format!("regex assertion failed: '{}' not matched", pattern));
+                            let message = format!("regex assertion failed: '{}' not matched", pattern);
+                            errors.push(message.clone());
+                            details.push(AssertionRunResult {
+                                assertion_type: "regex".to_string(),
+                                status: "failed".to_string(),
+                                message,
+                                path: None,
+                                expected: assertion.expected.clone(),
+                            });
+                        } else {
+                            details.push(AssertionRunResult {
+                                assertion_type: "regex".to_string(),
+                                status: "passed".to_string(),
+                                message: format!("regex assertion passed: '{}'", pattern),
+                                path: None,
+                                expected: assertion.expected.clone(),
+                            });
                         }
                     }
-                    Err(e) => errors.push(format!("invalid regex '{}': {}", pattern, e)),
+                    Err(e) => {
+                        let message = format!("invalid regex '{}': {}", pattern, e);
+                        errors.push(message.clone());
+                        details.push(AssertionRunResult {
+                            assertion_type: "regex".to_string(),
+                            status: "failed".to_string(),
+                            message,
+                            path: None,
+                            expected: assertion.expected.clone(),
+                        });
+                    }
                 }
             }
             "exists" => {
                 let path = assertion.path.as_deref().unwrap_or("$");
                 match &parsed_json {
-                    Some(json) if json_path_get(json, path).is_some() => {}
-                    Some(_) => errors.push(format!("exists assertion failed: path '{}' not found", path)),
-                    None => errors.push("exists assertion failed: response is not json".to_string()),
+                    Some(json) if json_path_get(json, path).is_some() => details.push(AssertionRunResult {
+                        assertion_type: "exists".to_string(),
+                        status: "passed".to_string(),
+                        message: format!("exists assertion passed at '{}'", path),
+                        path: Some(path.to_string()),
+                        expected: None,
+                    }),
+                    Some(_) => {
+                        let message = format!("exists assertion failed: path '{}' not found", path);
+                        errors.push(message.clone());
+                        details.push(AssertionRunResult {
+                            assertion_type: "exists".to_string(),
+                            status: "failed".to_string(),
+                            message,
+                            path: Some(path.to_string()),
+                            expected: None,
+                        });
+                    }
+                    None => {
+                        let message = "exists assertion failed: response is not json".to_string();
+                        errors.push(message.clone());
+                        details.push(AssertionRunResult {
+                            assertion_type: "exists".to_string(),
+                            status: "failed".to_string(),
+                            message,
+                            path: Some(path.to_string()),
+                            expected: None,
+                        });
+                    }
                 }
             }
             "json" => {
@@ -139,20 +281,66 @@ fn run_assertions(assertions: &[Assertion], status: u16, body: &str) -> Vec<Stri
                 let expected = assertion.expected.clone().unwrap_or(Value::Null);
                 match &parsed_json {
                     Some(json) => match json_path_get(json, path) {
-                        Some(actual) if actual == &expected => {}
-                        Some(actual) => errors.push(format!(
-                            "json assertion failed at '{}': expected {}, got {}",
-                            path, expected, actual
-                        )),
-                        None => errors.push(format!("json assertion failed: path '{}' not found", path)),
+                        Some(actual) if actual == &expected => details.push(AssertionRunResult {
+                            assertion_type: "json".to_string(),
+                            status: "passed".to_string(),
+                            message: format!("json assertion passed at '{}'", path),
+                            path: Some(path.to_string()),
+                            expected: Some(expected.clone()),
+                        }),
+                        Some(actual) => {
+                            let message = format!(
+                                "json assertion failed at '{}': expected {}, got {}",
+                                path, expected, actual
+                            );
+                            errors.push(message.clone());
+                            details.push(AssertionRunResult {
+                                assertion_type: "json".to_string(),
+                                status: "failed".to_string(),
+                                message,
+                                path: Some(path.to_string()),
+                                expected: Some(expected.clone()),
+                            });
+                        }
+                        None => {
+                            let message = format!("json assertion failed: path '{}' not found", path);
+                            errors.push(message.clone());
+                            details.push(AssertionRunResult {
+                                assertion_type: "json".to_string(),
+                                status: "failed".to_string(),
+                                message,
+                                path: Some(path.to_string()),
+                                expected: Some(expected.clone()),
+                            });
+                        }
                     },
-                    None => errors.push("json assertion failed: response is not json".to_string()),
+                    None => {
+                        let message = "json assertion failed: response is not json".to_string();
+                        errors.push(message.clone());
+                        details.push(AssertionRunResult {
+                            assertion_type: "json".to_string(),
+                            status: "failed".to_string(),
+                            message,
+                            path: Some(path.to_string()),
+                            expected: Some(expected.clone()),
+                        });
+                    }
                 }
             }
-            other => errors.push(format!("unsupported assertion type in runtime: {}", other)),
+            other => {
+                let message = format!("unsupported assertion type in runtime: {}", other);
+                errors.push(message.clone());
+                details.push(AssertionRunResult {
+                    assertion_type: other.to_string(),
+                    status: "failed".to_string(),
+                    message,
+                    path: assertion.path.clone(),
+                    expected: assertion.expected.clone(),
+                });
+            }
         }
     }
-    errors
+    (details, errors)
 }
 
 async fn execute_api_step(
@@ -171,6 +359,9 @@ async fn execute_api_step(
                 message: format!("invalid method '{}'", step.method),
                 response_status: None,
                 duration_ms: step_started.elapsed().as_millis(),
+                request: None,
+                response: None,
+                assertions: Vec::new(),
             }
         }
     };
@@ -182,10 +373,15 @@ async fn execute_api_step(
         format!("{}{}", base_url.trim_end_matches('/'), rendered_url)
     };
 
-    let mut req = client.request(method, full_url);
+    let full_url_for_report = full_url.clone();
+    let mut req = client.request(method.clone(), full_url);
+    let mut rendered_headers = BTreeMap::new();
     for (k, v) in &step.headers {
-        req = req.header(k, render_template(v, vars));
+        let rendered = render_template(v, vars);
+        rendered_headers.insert(k.clone(), rendered.clone());
+        req = req.header(k, rendered);
     }
+    let request_body = step.body.clone();
     if let Some(body) = &step.body {
         req = req.json(body);
     }
@@ -199,12 +395,27 @@ async fn execute_api_step(
                 message: format!("request failed: {}", e),
                 response_status: None,
                 duration_ms: step_started.elapsed().as_millis(),
+                request: Some(HttpRequestInfo {
+                    method: method.to_string(),
+                    url: full_url_for_report.clone(),
+                    headers: rendered_headers.clone(),
+                    body: request_body.clone(),
+                }),
+                response: None,
+                assertions: Vec::new(),
             }
         }
     };
     let status = response.status().as_u16();
+    let mut response_headers = BTreeMap::new();
+    for (k, v) in response.headers() {
+        response_headers.insert(
+            k.to_string(),
+            v.to_str().unwrap_or("<non-utf8>").to_string(),
+        );
+    }
     let body = response.text().await.unwrap_or_default();
-    let assertion_errors = run_assertions(&step.assertions, status, &body);
+    let (assertion_results, assertion_errors) = run_assertions(&step.assertions, status, &body);
     if assertion_errors.is_empty() {
         StepRunResult {
             name: step.name.clone(),
@@ -212,6 +423,18 @@ async fn execute_api_step(
             message: format!("OK ({})", status),
             response_status: Some(status),
             duration_ms: step_started.elapsed().as_millis(),
+            request: Some(HttpRequestInfo {
+                method: method.to_string(),
+                url: full_url_for_report,
+                headers: rendered_headers,
+                body: request_body,
+            }),
+            response: Some(HttpResponseInfo {
+                status,
+                headers: response_headers,
+                body,
+            }),
+            assertions: assertion_results,
         }
     } else {
         StepRunResult {
@@ -220,6 +443,18 @@ async fn execute_api_step(
             message: assertion_errors.join("; "),
             response_status: Some(status),
             duration_ms: step_started.elapsed().as_millis(),
+            request: Some(HttpRequestInfo {
+                method: method.to_string(),
+                url: full_url_for_report,
+                headers: rendered_headers,
+                body: request_body,
+            }),
+            response: Some(HttpResponseInfo {
+                status,
+                headers: response_headers,
+                body,
+            }),
+            assertions: assertion_results,
         }
     }
 }
@@ -285,6 +520,8 @@ pub async fn run_test(
         duration_ms: started.elapsed().as_millis(),
         errors,
         steps: step_results,
+        setup_steps: Vec::new(),
+        teardown_steps: Vec::new(),
     }
 }
 
@@ -320,6 +557,9 @@ async fn run_step_group(
                             message: e,
                             response_status: None,
                             duration_ms: 0,
+                            request: None,
+                            response: None,
+                            assertions: Vec::new(),
                         });
                     }
                 },
@@ -332,6 +572,9 @@ async fn run_step_group(
                         message: msg,
                         response_status: None,
                         duration_ms: 0,
+                        request: None,
+                        response: None,
+                        assertions: Vec::new(),
                     });
                 }
             }
