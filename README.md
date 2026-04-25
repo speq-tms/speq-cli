@@ -24,6 +24,41 @@ Core runtime is implemented in Rust.
 
 `run` report mode defaults to `allure` when `--report` is not set.
 
+## DSL highlights (alpha.2)
+
+New runtime DSL capabilities implemented in CLI:
+
+- `assert` now supports `type: schema` with `ref` (from `schemasDir`) or `inline`.
+- Modules support native `use action` with `imports`.
+- `use` steps support `properties` payload to pass per-call parameters into module actions.
+- `init.yaml` supports suite hooks and imports:
+  - `suite.beforeAll`, `suite.beforeEach`, `suite.afterEach`, `suite.afterAll`
+  - `suite.variables`
+  - `suite.imports` (available in hooks and inherited by suite tests)
+
+Action contract format in module files:
+
+```yaml
+actions:
+  getPostById:
+    properties: [postId]
+    steps:
+      - type: api
+        name: "GET /posts/{{postId}}"
+        method: GET
+        url: "/posts/{{postId}}"
+```
+
+Use from test or hook:
+
+```yaml
+- type: use
+  name: "Get post by id"
+  action: "jp.getPostById"
+  properties:
+    postId: "{{targetPostId}}"
+```
+
 ## Repository layout
 
 ```text

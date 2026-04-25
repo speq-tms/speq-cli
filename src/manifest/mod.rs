@@ -14,13 +14,41 @@ pub struct Manifest {
     pub suites_dir: Option<String>,
     #[serde(rename = "reportsDir", default)]
     pub reports_dir: Option<String>,
+    #[serde(rename = "schemasDir", default)]
+    pub schemas_dir: Option<String>,
+    #[serde(rename = "modulesDir", default)]
+    pub modules_dir: Option<String>,
 }
 
 impl Manifest {
+    pub fn environments_dir_or_default(&self) -> String {
+        self.environments_dir
+            .clone()
+            .unwrap_or_else(|| "environments".to_string())
+    }
+
     pub fn suites_dir_or_default(&self) -> String {
         self.suites_dir
             .clone()
             .unwrap_or_else(|| "suites".to_string())
+    }
+
+    pub fn reports_dir_or_default(&self) -> String {
+        self.reports_dir
+            .clone()
+            .unwrap_or_else(|| "reports".to_string())
+    }
+
+    pub fn schemas_dir_or_default(&self) -> String {
+        self.schemas_dir
+            .clone()
+            .unwrap_or_else(|| "schemas".to_string())
+    }
+
+    pub fn modules_dir_or_default(&self) -> String {
+        self.modules_dir
+            .clone()
+            .unwrap_or_else(|| "modules".to_string())
     }
 }
 
