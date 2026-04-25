@@ -1,7 +1,7 @@
 use crate::cli::discovery::discover_speq_root;
-use crate::cli::files::collect_yaml_files;
+use crate::cli::files::{collect_suite_init_files, collect_yaml_files};
 use crate::manifest::read_manifest;
-use crate::parser::parse_and_validate_test;
+use crate::parser::{parse_and_validate_suite_init, parse_and_validate_test};
 use serde_json::json;
 use std::fs;
 
@@ -18,6 +18,7 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
     }
 
     let files = collect_yaml_files(&suites_dir);
+    let init_files = collect_suite_init_files(&suites_dir);
 
     if files.is_empty() {
         return Err(format!("no suite YAML files found in {}", suites_dir.display()));
@@ -33,6 +34,15 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
         }
     }
 
+    for file in &init_files {
+        let content =
+            fs::read_to_string(file).map_err(|e| format!("failed to read suite init {}: {e}", file.display()))?;
+        let file_label = file.to_string_lossy().to_string();
+        if let Err(err) = parse_and_validate_suite_init(&content, &file_label) {
+            errors.push(err);
+        }
+    }
+
     if format_json {
         let payload = json!({
             "ok": errors.is_empty(),
@@ -40,6 +50,7 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
             "speqRoot": discovered.root.to_string_lossy(),
             "manifestVersion": manifest.version,
             "testsCount": files.len(),
+            "suiteInitCount": init_files.len(),
             "errors": errors
         });
         println!(

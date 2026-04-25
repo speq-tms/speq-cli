@@ -55,6 +55,28 @@ pub struct ReusableSpec {
     pub steps: Vec<Step>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteSection {
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+    #[serde(default, rename = "beforeAll")]
+    pub before_all: Vec<Step>,
+    #[serde(default, rename = "beforeEach")]
+    pub before_each: Vec<Step>,
+    #[serde(default, rename = "afterEach")]
+    pub after_each: Vec<Step>,
+    #[serde(default, rename = "afterAll")]
+    pub after_all: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInitSpec {
+    #[serde(default)]
+    pub suite: SuiteSection,
+}
+
 fn valid_http_method(method: &str) -> bool {
     matches!(
         method.to_ascii_uppercase().as_str(),
@@ -156,4 +178,24 @@ pub fn parse_reusable_steps(content: &str, file_path: &str) -> Result<Vec<Step>,
         validate_step(step, file_path, i)?;
     }
     Ok(parsed.steps)
+}
+
+pub fn parse_and_validate_suite_init(content: &str, file_path: &str) -> Result<SuiteInitSpec, String> {
+    let parsed = serde_yaml::from_str::<SuiteInitSpec>(content)
+        .map_err(|e| format!("YAML parse error in {}: {}", file_path, e))?;
+
+    for (i, step) in parsed.suite.before_all.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.before_each.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.after_each.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.after_all.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+
+    Ok(parsed)
 }
