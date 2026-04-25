@@ -1,8 +1,10 @@
 use crate::cli::discovery::discover_speq_root;
 use crate::cli::files::{collect_suite_init_files, collect_yaml_files, relative_unix};
-use crate::manifest::read_manifest;
-use crate::parser::{parse_and_validate_suite_init, parse_and_validate_test, Step, SuiteInitSpec, TestSpec};
-use crate::runner::{run_test, StepRunResult, TestRunResult};
+use crate::manifest::{read_manifest, Manifest};
+use crate::parser::{
+    parse_and_validate_suite_init, parse_and_validate_test, ImportSpec, Step, SuiteInitSpec, TestSpec,
+};
+use crate::runner::{run_test, RuntimePaths, StepRunResult, TestRunResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -68,6 +70,7 @@ pub struct SummaryReport {
 struct SuiteExecutionContext {
     suite_key: String,
     suite_variables: BTreeMap<String, serde_json::Value>,
+    suite_imports: Vec<ImportSpec>,
     before_all: Vec<Step>,
     before_each: Vec<Step>,
     after_each: Vec<Step>,
@@ -118,8 +121,14 @@ pub fn resolve_report_mode(raw: Option<String>) -> Result<ReportMode, String> {
     }
 }
 
-fn read_env_vars(speq_root: &Path, env_name: &str) -> Result<(String, BTreeMap<String, serde_json::Value>), String> {
-    let env_path = speq_root.join("environments").join(format!("{}.yaml", env_name));
+fn read_env_vars(
+    speq_root: &Path,
+    manifest: &Manifest,
+    env_name: &str,
+) -> Result<(String, BTreeMap<String, serde_json::Value>), String> {
+    let env_path = speq_root
+        .join(manifest.environments_dir_or_default())
+        .join(format!("{}.yaml", env_name));
     let content = fs::read_to_string(&env_path)
         .map_err(|e| format!("failed to read env file {}: {e}", env_path.display()))?;
     let parsed = serde_yaml::from_str::<EnvYaml>(&content)
@@ -183,12 +192,14 @@ fn build_suite_execution_context(
     let mut variables = BTreeMap::new();
     let mut before_each = Vec::new();
     let mut after_each = Vec::new();
+    let mut imports = Vec::new();
 
     for init_path in &chain {
         if let Some(spec) = init_cache.get(init_path) {
             for (k, v) in &spec.suite.variables {
                 variables.insert(k.clone(), v.clone());
             }
+            imports.extend(spec.suite.imports.clone());
             before_each.extend(spec.suite.before_each.clone());
             after_each.extend(spec.suite.after_each.clone());
         }
@@ -209,6 +220,7 @@ fn build_suite_execution_context(
     SuiteExecutionContext {
         suite_key: suite_key_for_test(suites_root, test_file),
         suite_variables: variables,
+        suite_imports: imports,
         before_all,
         before_each,
         after_each,
@@ -224,6 +236,8 @@ async fn run_hook_steps(
     suite_key: &str,
     base_url: &str,
     vars: &BTreeMap<String, serde_json::Value>,
+    runtime_paths: &RuntimePaths,
+    imports: &[ImportSpec],
 ) -> Option<HookExecutionResult> {
     if steps.is_empty() {
         return None;
@@ -234,6 +248,7 @@ async fn run_hook_steps(
         title: format!("{} hook ({})", hook_name, suite_key),
         tags: Vec::new(),
         variables: BTreeMap::new(),
+        imports: imports.to_vec(),
         setup: Vec::new(),
         steps: steps.to_vec(),
         cleanup: Vec::new(),
@@ -244,6 +259,7 @@ async fn run_hook_steps(
         format!("{}#{}", suite_key, hook_name),
         base_url,
         vars,
+        runtime_paths,
     )
     .await;
     let prefixed_steps = result
@@ -569,12 +585,16 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     let env_name = options
         .env_name
         .unwrap_or_else(|| manifest.default_environment.clone());
-    let (base_url, env_vars) = read_env_vars(&discovered.root, &env_name)?;
+    let (base_url, env_vars) = read_env_vars(&discovered.root, &manifest, &env_name)?;
     if base_url.trim().is_empty() {
         return Err("baseUrl is required in selected environment file".to_string());
     }
 
     let suites_root = discovered.root.join(manifest.suites_dir_or_default());
+    let runtime_paths = RuntimePaths {
+        schemas_root: discovered.root.join(manifest.schemas_dir_or_default()),
+        modules_root: discovered.root.join(manifest.modules_dir_or_default()),
+    };
     let files = collect_selected_files(
         &discovered.root,
         &manifest.suites_dir_or_default(),
@@ -617,6 +637,8 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &suite_ctx.suite_key,
                 &base_url,
                 &effective_vars,
+                &runtime_paths,
+                &suite_ctx.suite_imports,
             )
             .await
             {
@@ -655,8 +677,13 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &suite_ctx.suite_key,
             &base_url,
             &effective_vars,
+            &runtime_paths,
+            &suite_ctx.suite_imports,
         )
         .await;
+
+        let mut effective_imports = suite_ctx.suite_imports.clone();
+        effective_imports.extend(parsed.imports.clone());
 
         let mut test_result = if let Some(exec) = before_each_exec.clone() {
             if exec.status == "failed" {
@@ -673,10 +700,30 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                     teardown_steps: Vec::new(),
                 }
             } else {
-                run_test(&parsed, &file, rel, &base_url, &effective_vars).await
+                let mut parsed_for_run = parsed.clone();
+                parsed_for_run.imports = effective_imports.clone();
+                run_test(
+                    &parsed_for_run,
+                    &file,
+                    rel,
+                    &base_url,
+                    &effective_vars,
+                    &runtime_paths,
+                )
+                .await
             }
         } else {
-            run_test(&parsed, &file, rel, &base_url, &effective_vars).await
+            let mut parsed_for_run = parsed.clone();
+            parsed_for_run.imports = effective_imports.clone();
+            run_test(
+                &parsed_for_run,
+                &file,
+                rel,
+                &base_url,
+                &effective_vars,
+                &runtime_paths,
+            )
+            .await
         };
 
         if let Some(exec) = before_each_exec {
@@ -699,6 +746,8 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &suite_ctx.suite_key,
             &base_url,
             &effective_vars,
+            &runtime_paths,
+            &suite_ctx.suite_imports,
         )
         .await
         {
@@ -746,6 +795,8 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &suite_ctx.suite_key,
             &base_url,
             &effective_vars,
+            &runtime_paths,
+            &suite_ctx.suite_imports,
         )
         .await
         {
@@ -776,7 +827,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
 
     let reports_root = discovered
         .root
-        .join(manifest.reports_dir.clone().unwrap_or_else(|| "reports".to_string()));
+        .join(manifest.reports_dir_or_default());
     let summary_output = options.summary_output.clone();
     let summary_path = if let Some(raw_output) = summary_output {
         let p = PathBuf::from(raw_output);
