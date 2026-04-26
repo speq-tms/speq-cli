@@ -11,6 +11,8 @@ pub struct TestSpec {
     #[serde(default)]
     pub variables: BTreeMap<String, Value>,
     #[serde(default)]
+    pub imports: Vec<ImportSpec>,
+    #[serde(default)]
     pub setup: Vec<Step>,
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -33,8 +35,19 @@ pub struct Step {
     pub body: Option<Value>,
     #[serde(default)]
     pub r#ref: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
     #[serde(default, rename = "assert")]
     pub assertions: Vec<Assertion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportSpec {
+    pub module: String,
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,12 +60,40 @@ pub struct Assertion {
     pub expected: Option<Value>,
     #[serde(default)]
     pub value: Option<Value>,
+    #[serde(default)]
+    pub r#ref: Option<String>,
+    #[serde(default)]
+    pub inline: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReusableSpec {
     #[serde(default)]
     pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteSection {
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub imports: Vec<ImportSpec>,
+    #[serde(default, rename = "beforeAll")]
+    pub before_all: Vec<Step>,
+    #[serde(default, rename = "beforeEach")]
+    pub before_each: Vec<Step>,
+    #[serde(default, rename = "afterEach")]
+    pub after_each: Vec<Step>,
+    #[serde(default, rename = "afterAll")]
+    pub after_all: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInitSpec {
+    #[serde(default)]
+    pub suite: SuiteSection,
 }
 
 fn valid_http_method(method: &str) -> bool {
@@ -63,13 +104,37 @@ fn valid_http_method(method: &str) -> bool {
 }
 
 fn validate_assertion(assertion: &Assertion, file_path: &str, idx: usize) -> Result<(), String> {
-    let allowed = ["status", "json", "contains", "notcontains", "exists", "regex"];
+    let allowed = [
+        "status",
+        "json",
+        "contains",
+        "notcontains",
+        "exists",
+        "regex",
+        "schema",
+    ];
     if !allowed.contains(&assertion.assertion_type.as_str()) {
         return Err(format!(
             "unsupported assertion type '{}' in {} assert[{}]",
             assertion.assertion_type, file_path, idx
         ));
     }
+
+    if assertion.assertion_type == "schema" {
+        let has_ref = assertion
+            .r#ref
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_inline = assertion.inline.is_some();
+        if !has_ref && !has_inline {
+            return Err(format!(
+                "schema assertion requires 'ref' or 'inline' in {} assert[{}]",
+                file_path, idx
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -91,8 +156,21 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
             }
         }
         "use" => {
-            if step.r#ref.as_ref().map(|x| x.trim().is_empty()).unwrap_or(true) {
-                return Err(format!("step ref is required for use step in {} step[{}]", file_path, idx));
+            let has_ref = step
+                .r#ref
+                .as_ref()
+                .map(|x| !x.trim().is_empty())
+                .unwrap_or(false);
+            let has_action = step
+                .action
+                .as_ref()
+                .map(|x| !x.trim().is_empty())
+                .unwrap_or(false);
+            if !has_ref && !has_action {
+                return Err(format!(
+                    "step action or ref is required for use step in {} step[{}]",
+                    file_path, idx
+                ));
             }
         }
         other => {
@@ -127,6 +205,15 @@ pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpe
         ));
     }
 
+    for (import_idx, import) in parsed.imports.iter().enumerate() {
+        if import.module.trim().is_empty() {
+            return Err(format!(
+                "imports[{}].module is required in {}",
+                import_idx, file_path
+            ));
+        }
+    }
+
     for (i, step) in parsed.setup.iter().enumerate() {
         validate_step(step, file_path, i)?;
     }
@@ -156,4 +243,33 @@ pub fn parse_reusable_steps(content: &str, file_path: &str) -> Result<Vec<Step>,
         validate_step(step, file_path, i)?;
     }
     Ok(parsed.steps)
+}
+
+pub fn parse_and_validate_suite_init(content: &str, file_path: &str) -> Result<SuiteInitSpec, String> {
+    let parsed = serde_yaml::from_str::<SuiteInitSpec>(content)
+        .map_err(|e| format!("YAML parse error in {}: {}", file_path, e))?;
+
+    for (import_idx, import) in parsed.suite.imports.iter().enumerate() {
+        if import.module.trim().is_empty() {
+            return Err(format!(
+                "suite.imports[{}].module is required in {}",
+                import_idx, file_path
+            ));
+        }
+    }
+
+    for (i, step) in parsed.suite.before_all.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.before_each.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.after_each.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+    for (i, step) in parsed.suite.after_all.iter().enumerate() {
+        validate_step(step, file_path, i)?;
+    }
+
+    Ok(parsed)
 }

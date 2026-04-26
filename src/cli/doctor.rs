@@ -10,12 +10,10 @@ pub fn command_doctor(speq_root_override: Option<String>, format_json: bool) -> 
 
     let manifest = read_manifest(&discovered.root)?;
     let suites_dir = discovered.root.join(manifest.suites_dir_or_default());
-    let environments_dir = discovered
-        .root
-        .join(manifest.environments_dir.clone().unwrap_or_else(|| "environments".to_string()));
-    let reports_dir = discovered
-        .root
-        .join(manifest.reports_dir.clone().unwrap_or_else(|| "reports".to_string()));
+    let environments_dir = discovered.root.join(manifest.environments_dir_or_default());
+    let reports_dir = discovered.root.join(manifest.reports_dir_or_default());
+    let schemas_dir = discovered.root.join(manifest.schemas_dir_or_default());
+    let modules_dir = discovered.root.join(manifest.modules_dir_or_default());
 
     let tests_count = if suites_dir.is_dir() {
         collect_yaml_files(&suites_dir).len()
@@ -33,6 +31,10 @@ pub fn command_doctor(speq_root_override: Option<String>, format_json: bool) -> 
       "environmentsDir": environments_dir.to_string_lossy(),
       "environmentsDirExists": environments_dir.is_dir(),
       "reportsDir": reports_dir.to_string_lossy(),
+      "schemasDir": schemas_dir.to_string_lossy(),
+      "schemasDirExists": schemas_dir.is_dir(),
+      "modulesDir": modules_dir.to_string_lossy(),
+      "modulesDirExists": modules_dir.is_dir(),
       "testsCount": tests_count
     });
 

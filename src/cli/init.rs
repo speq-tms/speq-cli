@@ -44,7 +44,9 @@ fn write_manifest(root: &Path, project: &str) -> Result<(), String> {
         "defaultEnvironment": "ci",
         "environmentsDir": "environments",
         "suitesDir": "suites",
-        "reportsDir": "reports"
+        "reportsDir": "reports",
+        "schemasDir": "schemas",
+        "modulesDir": "modules"
     });
     let yaml = serde_yaml::to_string(
         &serde_json::from_value::<Value>(manifest)
@@ -92,6 +94,8 @@ pub fn command_init(mode: Option<String>) -> Result<(), String> {
         .map_err(|e| format!("failed to create environments dir: {e}"))?;
     fs::create_dir_all(root.join("suites")).map_err(|e| format!("failed to create suites dir: {e}"))?;
     fs::create_dir_all(root.join("reports")).map_err(|e| format!("failed to create reports dir: {e}"))?;
+    fs::create_dir_all(root.join("schemas")).map_err(|e| format!("failed to create schemas dir: {e}"))?;
+    fs::create_dir_all(root.join("modules")).map_err(|e| format!("failed to create modules dir: {e}"))?;
 
     let project = project_name_from_cwd(&cwd);
     write_manifest(&root, &project)?;
