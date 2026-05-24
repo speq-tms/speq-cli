@@ -1,3 +1,4 @@
+use crate::fixtures::{load_fixture, materialize_fixture};
 use crate::generator::{resolve_gen_values, resolve_gen_variables};
 use crate::parser::{parse_reusable_steps, Assertion, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
@@ -79,6 +80,7 @@ pub struct TestRunResult {
 pub struct RuntimePaths {
     pub schemas_root: PathBuf,
     pub modules_root: PathBuf,
+    pub fixtures_root: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -697,8 +699,43 @@ async fn execute_api_step(
         rendered_headers.insert(k.clone(), rendered.clone());
         req = req.header(k, rendered);
     }
-    let request_body = step.body.clone();
-    if let Some(body) = &step.body {
+    let effective_body: Option<Value> = if let Some(bff) = &step.body_from_fixture {
+        let fixture_path = runtime_paths.fixtures_root.join(&bff.r#ref);
+        match load_fixture(&fixture_path) {
+            Ok(fixture_cfg) => match materialize_fixture(&fixture_cfg, bff.overrides.as_ref()) {
+                Ok(body) => Some(body),
+                Err(e) => {
+                    return StepRunResult {
+                        name: step.name.clone(),
+                        status: "failed".to_string(),
+                        message: e,
+                        response_status: None,
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: None,
+                        response: None,
+                        assertions: Vec::new(),
+                    }
+                }
+            },
+            Err(e) => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message: e,
+                    response_status: None,
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: None,
+                    response: None,
+                    assertions: Vec::new(),
+                }
+            }
+        }
+    } else {
+        step.body.clone()
+    };
+
+    let request_body = effective_body.clone();
+    if let Some(body) = &effective_body {
         let (resolved_body, gen_errors) = resolve_gen_values(body, "body");
         if !gen_errors.is_empty() {
             return StepRunResult {
@@ -1073,6 +1110,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
 
         let assertions = vec![Assertion {
@@ -1094,6 +1132,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             schemas_root: root.join("schemas"),
             modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
         };
         let assertions = vec![Assertion {
             assertion_type: "schema".to_string(),
@@ -1136,6 +1175,7 @@ actions:
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
         let imports = vec![ImportSpec {
             module: "auth".to_string(),
@@ -1148,6 +1188,7 @@ actions:
             url: String::new(),
             headers: BTreeMap::new(),
             body: None,
+            body_from_fixture: None,
             r#ref: None,
             action: Some("auth.login".to_string()),
             properties: BTreeMap::new(),
@@ -1184,6 +1225,7 @@ actions:
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
         let imports = vec![ImportSpec {
             module: "posts".to_string(),
@@ -1196,6 +1238,7 @@ actions:
             url: String::new(),
             headers: BTreeMap::new(),
             body: None,
+            body_from_fixture: None,
             r#ref: None,
             action: Some("posts.getById".to_string()),
             properties: BTreeMap::new(),

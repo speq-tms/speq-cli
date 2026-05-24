@@ -4,6 +4,13 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyFromFixture {
+    pub r#ref: String,
+    #[serde(default)]
+    pub overrides: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestSpec {
     pub id: String,
     pub title: String,
@@ -34,6 +41,8 @@ pub struct Step {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body: Option<Value>,
+    #[serde(default, rename = "bodyFromFixture")]
+    pub body_from_fixture: Option<BodyFromFixture>,
     #[serde(default)]
     pub r#ref: Option<String>,
     #[serde(default)]
@@ -155,6 +164,12 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
             if step.url.trim().is_empty() {
                 return Err(format!("step url is required for api step in {} step[{}]", file_path, idx));
             }
+            if step.body.is_some() && step.body_from_fixture.is_some() {
+                return Err(format!(
+                    "step cannot have both 'body' and 'bodyFromFixture' in {} step[{}]",
+                    file_path, idx
+                ));
+            }
             if let Some(body) = &step.body {
                 let gen_errors = validate_gen_in_value(body, "body", file_path);
                 if !gen_errors.is_empty() {
@@ -162,6 +177,22 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
                         "gen validation failed in {} step[{}]: {}",
                         file_path, idx, gen_errors.join("; ")
                     ));
+                }
+            }
+            if let Some(bff) = &step.body_from_fixture {
+                if bff.r#ref.trim().is_empty() {
+                    return Err(format!(
+                        "bodyFromFixture.ref is required in {} step[{}]",
+                        file_path, idx
+                    ));
+                }
+                if let Some(overrides) = &bff.overrides {
+                    if !overrides.is_object() {
+                        return Err(format!(
+                            "bodyFromFixture.overrides must be an object in {} step[{}]",
+                            file_path, idx
+                        ));
+                    }
                 }
             }
         }

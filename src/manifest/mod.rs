@@ -18,6 +18,8 @@ pub struct Manifest {
     pub schemas_dir: Option<String>,
     #[serde(rename = "modulesDir", default)]
     pub modules_dir: Option<String>,
+    #[serde(rename = "fixturesDir", default)]
+    pub fixtures_dir: Option<String>,
 }
 
 impl Manifest {
@@ -49,6 +51,12 @@ impl Manifest {
         self.modules_dir
             .clone()
             .unwrap_or_else(|| "modules".to_string())
+    }
+
+    pub fn fixtures_dir_or_default(&self) -> String {
+        self.fixtures_dir
+            .clone()
+            .unwrap_or_else(|| "fixtures".to_string())
     }
 }
 
