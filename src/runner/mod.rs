@@ -1,3 +1,4 @@
+use crate::generator::{resolve_gen_values, resolve_gen_variables};
 use crate::parser::{parse_reusable_steps, Assertion, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
 use regex::Regex;
@@ -698,7 +699,20 @@ async fn execute_api_step(
     }
     let request_body = step.body.clone();
     if let Some(body) = &step.body {
-        req = req.json(body);
+        let (resolved_body, gen_errors) = resolve_gen_values(body, "body");
+        if !gen_errors.is_empty() {
+            return StepRunResult {
+                name: step.name.clone(),
+                status: "failed".to_string(),
+                message: gen_errors.join("; "),
+                response_status: None,
+                duration_ms: step_started.elapsed().as_millis(),
+                request: None,
+                response: None,
+                assertions: Vec::new(),
+            };
+        }
+        req = req.json(&resolved_body);
     }
 
     let response = match req.send().await {
@@ -812,8 +826,26 @@ pub async fn run_test(
     for (k, v) in imported_vars {
         vars.insert(k, v);
     }
-    for (k, v) in &test.variables {
-        vars.insert(k.clone(), v.clone());
+    match resolve_gen_variables(&test.variables) {
+        Ok(resolved_vars) => {
+            for (k, v) in resolved_vars {
+                vars.insert(k, v);
+            }
+        }
+        Err(gen_errors) => {
+            return TestRunResult {
+                id: test.id.clone(),
+                title: test.title.clone(),
+                tags: test.tags.clone(),
+                file: rel_file,
+                status: "failed".to_string(),
+                duration_ms: started.elapsed().as_millis(),
+                errors: gen_errors,
+                steps: Vec::new(),
+                setup_steps: Vec::new(),
+                teardown_steps: Vec::new(),
+            };
+        }
     }
 
     let mut step_results = Vec::new();

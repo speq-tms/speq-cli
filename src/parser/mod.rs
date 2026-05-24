@@ -1,3 +1,4 @@
+use crate::generator::{validate_gen_in_value, validate_gen_in_variables};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -154,6 +155,15 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
             if step.url.trim().is_empty() {
                 return Err(format!("step url is required for api step in {} step[{}]", file_path, idx));
             }
+            if let Some(body) = &step.body {
+                let gen_errors = validate_gen_in_value(body, "body", file_path);
+                if !gen_errors.is_empty() {
+                    return Err(format!(
+                        "gen validation failed in {} step[{}]: {}",
+                        file_path, idx, gen_errors.join("; ")
+                    ));
+                }
+            }
         }
         "use" => {
             let has_ref = step
@@ -212,6 +222,11 @@ pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpe
                 import_idx, file_path
             ));
         }
+    }
+
+    let gen_var_errors = validate_gen_in_variables(&parsed.variables, file_path);
+    if !gen_var_errors.is_empty() {
+        return Err(gen_var_errors.join("; "));
     }
 
     for (i, step) in parsed.setup.iter().enumerate() {

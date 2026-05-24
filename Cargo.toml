@@ -18,3 +18,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 regex = "1"
 jsonschema = "0.18"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+fake = { version = "2", features = ["derive"] }
+rand = "0.8"
