@@ -49,6 +49,8 @@ pub struct TestSpec {
 pub struct Step {
     #[serde(rename = "type")]
     pub step_type: String,
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub method: String,
@@ -66,6 +68,8 @@ pub struct Step {
     pub action: Option<String>,
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,
+    #[serde(default, rename = "as")]
+    pub r#as: Option<String>,
     #[serde(default, rename = "assert")]
     pub assertions: Vec<Assertion>,
     #[serde(default)]
@@ -231,6 +235,16 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
                     "step action or ref is required for use step in {} step[{}]",
                     file_path, idx
                 ));
+            }
+            if let Some(as_id) = &step.r#as {
+                let valid = !as_id.is_empty()
+                    && as_id.chars().all(|c| c.is_alphanumeric() || c == '_');
+                if !valid {
+                    return Err(format!(
+                        "'as' must be a valid identifier (alphanumeric and underscore only) in {} step[{}]",
+                        file_path, idx
+                    ));
+                }
             }
         }
         other => {
