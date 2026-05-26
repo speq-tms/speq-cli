@@ -155,6 +155,21 @@ fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
     out
 }
 
+fn render_template_in_value(value: &Value, vars: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(s) => Value::String(render_template(s, vars)),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), render_template_in_value(v, vars));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| render_template_in_value(v, vars)).collect()),
+        other => other.clone(),
+    }
+}
+
 fn json_path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     if path == "$" {
         return Some(root);
@@ -187,7 +202,17 @@ fn check_condition(condition: &ConditionConfig, body: &str) -> bool {
                 return false;
             };
             match json_path_get(&json, &condition.path) {
-                Some(actual) => actual == &condition.equals,
+                Some(actual) => {
+                    let actual_str = match actual {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let equals_str = match &condition.equals {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    actual_str == equals_str
+                }
                 None => false,
             }
         }
@@ -870,7 +895,7 @@ async fn execute_api_step(
                 wait_duration_ms: None,
             };
         }
-        Some(resolved)
+        Some(render_template_in_value(&resolved, vars))
     } else {
         None
     };
