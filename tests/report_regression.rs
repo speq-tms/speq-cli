@@ -77,6 +77,8 @@ fn write_allure_results_writes_setup_and_teardown_to_container() {
             request: None,
             response: None,
             assertions: Vec::new(),
+            attempts_used: None,
+            wait_duration_ms: None,
         }],
         setup_steps: vec![StepRunResult {
             name: "[setup] beforeEach :: login".to_string(),
@@ -87,6 +89,8 @@ fn write_allure_results_writes_setup_and_teardown_to_container() {
             request: None,
             response: None,
             assertions: Vec::new(),
+            attempts_used: None,
+            wait_duration_ms: None,
         }],
         teardown_steps: vec![StepRunResult {
             name: "[teardown] afterEach :: logout".to_string(),
@@ -97,6 +101,8 @@ fn write_allure_results_writes_setup_and_teardown_to_container() {
             request: None,
             response: None,
             assertions: Vec::new(),
+            attempts_used: None,
+            wait_duration_ms: None,
         }],
     };
 
@@ -142,6 +148,8 @@ fn write_allure_results_writes_request_response_and_assertions_attachments() {
             path: Some("$.id".to_string()),
             expected: Some(json!(1)),
         }],
+        attempts_used: None,
+        wait_duration_ms: None,
     };
     let result = TestRunResult {
         id: "attachments.case".to_string(),

@@ -1,6 +1,7 @@
 use crate::fixtures::{load_fixture, materialize_fixture};
 use crate::generator::{resolve_gen_values, resolve_gen_variables};
-use crate::parser::{parse_reusable_steps, Assertion, ImportSpec, Step, TestSpec};
+use crate::manifest::{BackoffStrategy, RetryConfig};
+use crate::parser::{parse_reusable_steps, Assertion, ConditionConfig, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
 use regex::Regex;
 use reqwest::Method;
@@ -10,7 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +58,10 @@ pub struct StepRunResult {
     pub response: Option<HttpResponseInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<AssertionRunResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +162,34 @@ fn json_path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
         current = current.get(part)?;
     }
     Some(current)
+}
+
+fn compute_delay_ms(config: &RetryConfig, attempt: u32) -> u64 {
+    if config.delay_ms == 0 {
+        return 0;
+    }
+    match config.backoff {
+        BackoffStrategy::Fixed => config.delay_ms,
+        BackoffStrategy::Exponential => {
+            let exp = (attempt - 1).min(16) as u32;
+            config.delay_ms.saturating_mul(1u64 << exp)
+        }
+    }
+}
+
+fn check_condition(condition: &ConditionConfig, body: &str) -> bool {
+    match condition.condition_type.as_str() {
+        "jsonpath" => {
+            let Ok(json) = serde_json::from_str::<Value>(body) else {
+                return false;
+            };
+            match json_path_get(&json, &condition.path) {
+                Some(actual) => actual == &condition.equals,
+                None => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn module_alias(import: &ImportSpec) -> String {
@@ -666,8 +699,10 @@ async fn execute_api_step(
     step: &Step,
     runtime_paths: &RuntimePaths,
     cache: &mut RuntimeCaches,
+    retry_config: Option<&RetryConfig>,
 ) -> StepRunResult {
     let step_started = Instant::now();
+
     let method = match Method::from_bytes(step.method.to_ascii_uppercase().as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -680,6 +715,8 @@ async fn execute_api_step(
                 request: None,
                 response: None,
                 assertions: Vec::new(),
+                attempts_used: None,
+                wait_duration_ms: None,
             }
         }
     };
@@ -691,14 +728,12 @@ async fn execute_api_step(
         format!("{}{}", base_url.trim_end_matches('/'), rendered_url)
     };
 
-    let full_url_for_report = full_url.clone();
-    let mut req = client.request(method.clone(), full_url);
     let mut rendered_headers = BTreeMap::new();
     for (k, v) in &step.headers {
         let rendered = render_template(v, vars);
-        rendered_headers.insert(k.clone(), rendered.clone());
-        req = req.header(k, rendered);
+        rendered_headers.insert(k.clone(), rendered);
     }
+
     let effective_body: Option<Value> = if let Some(bff) = &step.body_from_fixture {
         let fixture_path = runtime_paths.fixtures_root.join(&bff.r#ref);
         match load_fixture(&fixture_path) {
@@ -714,6 +749,8 @@ async fn execute_api_step(
                         request: None,
                         response: None,
                         assertions: Vec::new(),
+                        attempts_used: None,
+                        wait_duration_ms: None,
                     }
                 }
             },
@@ -727,6 +764,8 @@ async fn execute_api_step(
                     request: None,
                     response: None,
                     assertions: Vec::new(),
+                    attempts_used: None,
+                    wait_duration_ms: None,
                 }
             }
         }
@@ -734,9 +773,8 @@ async fn execute_api_step(
         step.body.clone()
     };
 
-    let request_body = effective_body.clone();
-    if let Some(body) = &effective_body {
-        let (resolved_body, gen_errors) = resolve_gen_values(body, "body");
+    let resolved_body: Option<Value> = if let Some(body) = &effective_body {
+        let (resolved, gen_errors) = resolve_gen_values(body, "body");
         if !gen_errors.is_empty() {
             return StepRunResult {
                 name: step.name.clone(),
@@ -747,86 +785,233 @@ async fn execute_api_step(
                 request: None,
                 response: None,
                 assertions: Vec::new(),
+                attempts_used: None,
+                wait_duration_ms: None,
             };
         }
-        req = req.json(&resolved_body);
-    }
-
-    let response = match req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            return StepRunResult {
-                name: step.name.clone(),
-                status: "failed".to_string(),
-                message: format!("request failed: {}", e),
-                response_status: None,
-                duration_ms: step_started.elapsed().as_millis(),
-                request: Some(HttpRequestInfo {
-                    method: method.to_string(),
-                    url: full_url_for_report.clone(),
-                    headers: rendered_headers.clone(),
-                    body: request_body.clone(),
-                }),
-                response: None,
-                assertions: Vec::new(),
-            }
-        }
-    };
-    let status = response.status().as_u16();
-    let mut response_headers = BTreeMap::new();
-    for (k, v) in response.headers() {
-        response_headers.insert(
-            k.to_string(),
-            v.to_str().unwrap_or("<non-utf8>").to_string(),
-        );
-    }
-    let body = response.text().await.unwrap_or_default();
-    let (assertion_results, assertion_errors) = run_assertions(
-        &step.assertions,
-        status,
-        &body,
-        runtime_paths,
-        &mut cache.schema_cache,
-    );
-    if assertion_errors.is_empty() {
-        StepRunResult {
-            name: step.name.clone(),
-            status: "passed".to_string(),
-            message: format!("OK ({})", status),
-            response_status: Some(status),
-            duration_ms: step_started.elapsed().as_millis(),
-            request: Some(HttpRequestInfo {
-                method: method.to_string(),
-                url: full_url_for_report,
-                headers: rendered_headers,
-                body: request_body,
-            }),
-            response: Some(HttpResponseInfo {
-                status,
-                headers: response_headers,
-                body,
-            }),
-            assertions: assertion_results,
-        }
+        Some(resolved)
     } else {
-        StepRunResult {
-            name: step.name.clone(),
-            status: "failed".to_string(),
-            message: assertion_errors.join("; "),
-            response_status: Some(status),
-            duration_ms: step_started.elapsed().as_millis(),
-            request: Some(HttpRequestInfo {
-                method: method.to_string(),
-                url: full_url_for_report,
-                headers: rendered_headers,
-                body: request_body,
-            }),
-            response: Some(HttpResponseInfo {
-                status,
-                headers: response_headers,
-                body,
-            }),
-            assertions: assertion_results,
+        None
+    };
+
+    let request_info = HttpRequestInfo {
+        method: method.to_string(),
+        url: full_url.clone(),
+        headers: rendered_headers.clone(),
+        body: effective_body.clone(),
+    };
+
+    let effective_retry = retry_config.filter(|c| c.enabled && c.max_attempts > 0);
+    let max_attempts = effective_retry.map(|c| c.max_attempts).unwrap_or(1).max(1);
+
+    let mut total_attempts: u32 = 0;
+    let waiter_start = Instant::now();
+
+    loop {
+        // Retry loop for one HTTP call (with retry on transient failures)
+        enum RequestOutcome {
+            Success { status: u16, resp_headers: BTreeMap<String, String>, body: String },
+            NetworkFail { message: String },
+            StatusRetryExhausted { status: u16, resp_headers: BTreeMap<String, String>, body: String },
+        }
+
+        let mut retry_attempt: u32 = 0;
+
+        let outcome: RequestOutcome = 'retry: loop {
+            retry_attempt += 1;
+            total_attempts += 1;
+
+            let mut req = client.request(method.clone(), full_url.clone());
+            for (k, v) in &rendered_headers {
+                req = req.header(k, v);
+            }
+            if let Some(body) = &resolved_body {
+                req = req.json(body);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let mut resp_headers = BTreeMap::new();
+                    for (k, v) in resp.headers() {
+                        resp_headers.insert(k.to_string(), v.to_str().unwrap_or("<non-utf8>").to_string());
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+
+                    let should_retry_status = effective_retry
+                        .map(|c| c.retry_on.status_codes.contains(&status))
+                        .unwrap_or(false);
+
+                    if should_retry_status && retry_attempt < max_attempts {
+                        let delay = compute_delay_ms(effective_retry.unwrap(), retry_attempt);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        continue 'retry;
+                    }
+
+                    if should_retry_status {
+                        break 'retry RequestOutcome::StatusRetryExhausted { status, resp_headers, body };
+                    } else {
+                        break 'retry RequestOutcome::Success { status, resp_headers, body };
+                    }
+                }
+                Err(e) => {
+                    let should_retry_network = effective_retry
+                        .map(|c| c.retry_on.network_errors)
+                        .unwrap_or(false);
+
+                    if should_retry_network && retry_attempt < max_attempts {
+                        let delay = compute_delay_ms(effective_retry.unwrap(), retry_attempt);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        continue 'retry;
+                    }
+
+                    let msg = if should_retry_network {
+                        format!("retry_exhausted: request failed after {} attempt(s): {}", retry_attempt, e)
+                    } else {
+                        format!("request failed: {}", e)
+                    };
+                    break 'retry RequestOutcome::NetworkFail { message: msg };
+                }
+            }
+        };
+
+        match outcome {
+            RequestOutcome::NetworkFail { message } => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message,
+                    response_status: None,
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: Some(request_info),
+                    response: None,
+                    assertions: Vec::new(),
+                    attempts_used: Some(total_attempts),
+                    wait_duration_ms: None,
+                };
+            }
+            RequestOutcome::StatusRetryExhausted { status, resp_headers, body } => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message: format!(
+                        "retry_exhausted: request failed with status {} after {} attempt(s)",
+                        status, total_attempts
+                    ),
+                    response_status: Some(status),
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: Some(request_info),
+                    response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                    assertions: Vec::new(),
+                    attempts_used: Some(total_attempts),
+                    wait_duration_ms: None,
+                };
+            }
+            RequestOutcome::Success { status, resp_headers, body } => {
+                // Check condition (waiter)
+                if let Some(condition) = &step.condition {
+                    if check_condition(condition, &body) {
+                        // Condition met — run assertions and return
+                        let (assertion_results, assertion_errors) = run_assertions(
+                            &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                        );
+                        let wait_duration = waiter_start.elapsed().as_millis() as u64;
+                        return StepRunResult {
+                            name: step.name.clone(),
+                            status: if assertion_errors.is_empty() { "passed".to_string() } else { "failed".to_string() },
+                            message: if assertion_errors.is_empty() {
+                                format!("OK ({}) — condition met", status)
+                            } else {
+                                assertion_errors.join("; ")
+                            },
+                            response_status: Some(status),
+                            duration_ms: step_started.elapsed().as_millis(),
+                            request: Some(request_info),
+                            response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                            assertions: assertion_results,
+                            attempts_used: Some(total_attempts),
+                            wait_duration_ms: Some(wait_duration),
+                        };
+                    }
+
+                    // Condition not met
+                    if let Some(wait) = &condition.wait {
+                        let elapsed_ms = waiter_start.elapsed().as_millis() as u64;
+                        if elapsed_ms + wait.interval_ms > wait.timeout_ms {
+                            return StepRunResult {
+                                name: step.name.clone(),
+                                status: "failed".to_string(),
+                                message: format!(
+                                    "wait_timeout: condition ({} {} = {}) not met within {}ms",
+                                    condition.condition_type, condition.path, condition.equals, wait.timeout_ms
+                                ),
+                                response_status: Some(status),
+                                duration_ms: step_started.elapsed().as_millis(),
+                                request: Some(request_info),
+                                response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                                assertions: Vec::new(),
+                                attempts_used: Some(total_attempts),
+                                wait_duration_ms: Some(elapsed_ms),
+                            };
+                        }
+                        tokio::time::sleep(Duration::from_millis(wait.interval_ms)).await;
+                        continue; // outer waiter loop
+                    } else {
+                        return StepRunResult {
+                            name: step.name.clone(),
+                            status: "failed".to_string(),
+                            message: format!(
+                                "condition not met: {} at {} (expected {})",
+                                condition.condition_type, condition.path, condition.equals
+                            ),
+                            response_status: Some(status),
+                            duration_ms: step_started.elapsed().as_millis(),
+                            request: Some(request_info),
+                            response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                            assertions: Vec::new(),
+                            attempts_used: Some(total_attempts),
+                            wait_duration_ms: None,
+                        };
+                    }
+                }
+
+                // No condition — run assertions and return
+                let (assertion_results, assertion_errors) = run_assertions(
+                    &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                );
+                let attempts_field = if total_attempts > 1 { Some(total_attempts) } else { None };
+                return if assertion_errors.is_empty() {
+                    StepRunResult {
+                        name: step.name.clone(),
+                        status: "passed".to_string(),
+                        message: format!("OK ({})", status),
+                        response_status: Some(status),
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: Some(request_info),
+                        response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                        assertions: assertion_results,
+                        attempts_used: attempts_field,
+                        wait_duration_ms: None,
+                    }
+                } else {
+                    StepRunResult {
+                        name: step.name.clone(),
+                        status: "failed".to_string(),
+                        message: assertion_errors.join("; "),
+                        response_status: Some(status),
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: Some(request_info),
+                        response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                        assertions: assertion_results,
+                        attempts_used: attempts_field,
+                        wait_duration_ms: None,
+                    }
+                };
+            }
         }
     }
 }
@@ -838,6 +1023,7 @@ pub async fn run_test(
     base_url: &str,
     env_vars: &BTreeMap<String, Value>,
     runtime_paths: &RuntimePaths,
+    retry_config: Option<&RetryConfig>,
 ) -> TestRunResult {
     let started = Instant::now();
     let client = reqwest::Client::new();
@@ -899,6 +1085,7 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
     run_step_group(
@@ -912,6 +1099,7 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
     run_step_group(
@@ -925,6 +1113,7 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
 
@@ -957,6 +1146,7 @@ async fn run_step_group(
     cache: &mut RuntimeCaches,
     step_results: &mut Vec<StepRunResult>,
     errors: &mut Vec<String>,
+    retry_config: Option<&RetryConfig>,
 ) {
     for step in steps {
         if step.step_type == "use" {
@@ -977,6 +1167,8 @@ async fn run_step_group(
                                     request: None,
                                     response: None,
                                     assertions: Vec::new(),
+                                    attempts_used: None,
+                                    wait_duration_ms: None,
                                 });
                                 continue;
                             }
@@ -998,11 +1190,13 @@ async fn run_step_group(
                                     request: None,
                                     response: None,
                                     assertions: Vec::new(),
+                                    attempts_used: None,
+                                    wait_duration_ms: None,
                                 });
                                 continue;
                             }
                             let result =
-                                execute_api_step(client, &action_vars, base_url, &action_step, runtime_paths, cache)
+                                execute_api_step(client, &action_vars, base_url, &action_step, runtime_paths, cache, retry_config)
                                     .await;
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
@@ -1021,6 +1215,8 @@ async fn run_step_group(
                             request: None,
                             response: None,
                             assertions: Vec::new(),
+                            attempts_used: None,
+                            wait_duration_ms: None,
                         });
                     }
                 }
@@ -1034,7 +1230,7 @@ async fn run_step_group(
                     Ok(reusable_steps) => {
                         for reusable in reusable_steps {
                             let result =
-                                execute_api_step(client, vars, base_url, &reusable, runtime_paths, cache).await;
+                                execute_api_step(client, vars, base_url, &reusable, runtime_paths, cache, retry_config).await;
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
                             }
@@ -1052,6 +1248,8 @@ async fn run_step_group(
                             request: None,
                             response: None,
                             assertions: Vec::new(),
+                            attempts_used: None,
+                            wait_duration_ms: None,
                         });
                     }
                 },
@@ -1067,11 +1265,13 @@ async fn run_step_group(
                         request: None,
                         response: None,
                         assertions: Vec::new(),
+                        attempts_used: None,
+                        wait_duration_ms: None,
                     });
                 }
             }
         } else {
-            let result = execute_api_step(client, vars, base_url, step, runtime_paths, cache).await;
+            let result = execute_api_step(client, vars, base_url, step, runtime_paths, cache, retry_config).await;
             if result.status == "failed" {
                 errors.push(result.message.clone());
             }
@@ -1193,11 +1393,269 @@ actions:
             action: Some("auth.login".to_string()),
             properties: BTreeMap::new(),
             assertions: Vec::new(),
+            condition: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
         assert_eq!(resolved.steps.len(), 1);
         assert_eq!(resolved.steps[0].step_type, "api");
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_nth_attempt() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Minimal HTTP server: returns 503 on first 2 calls, then 200
+        let fail_times = 2u32;
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let call_count_srv = call_count.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            for _ in 0..10u32 {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let n = call_count_srv.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if n < fail_times {
+                    (503u16, r#"{"error":"unavailable"}"#)
+                } else {
+                    (200u16, r#"{"ok":true}"#)
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let root = make_tmp_dir("retry-ok");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let retry = crate::manifest::RetryConfig {
+            enabled: true,
+            max_attempts: 5,
+            delay_ms: 0,
+            backoff: crate::manifest::BackoffStrategy::Fixed,
+            retry_on: crate::manifest::RetryOn {
+                network_errors: false,
+                status_codes: vec![503],
+            },
+        };
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            name: "test retry".to_string(),
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:{}/retry-ok", port),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        // 2 failures + 1 success = 3 total attempts
+        assert_eq!(result.attempts_used, Some(3));
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_returns_error() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/always-fail");
+            then.status(429).body("rate limited");
+        })
+        .await;
+
+        let root = make_tmp_dir("retry-exhausted");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let retry = crate::manifest::RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            delay_ms: 0,
+            backoff: crate::manifest::BackoffStrategy::Fixed,
+            retry_on: crate::manifest::RetryOn {
+                network_errors: false,
+                status_codes: vec![429],
+            },
+        };
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            name: "exhausted".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/always-fail", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("retry_exhausted"), "expected retry_exhausted, got: {}", result.message);
+        assert_eq!(result.attempts_used, Some(3));
+    }
+
+    #[tokio::test]
+    async fn waiter_timeout_returns_error() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/status");
+            then.status(200).body(r#"{"state":"pending"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("waiter-timeout");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            name: "waiter".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/status", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            assertions: Vec::new(),
+            condition: Some(crate::parser::ConditionConfig {
+                condition_type: "jsonpath".to_string(),
+                path: "$.state".to_string(),
+                equals: serde_json::json!("done"),
+                wait: Some(crate::parser::WaitConfig {
+                    timeout_ms: 200,
+                    interval_ms: 50,
+                }),
+            }),
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("wait_timeout"), "expected wait_timeout, got: {}", result.message);
+        assert!(result.wait_duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn waiter_succeeds_when_condition_met() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/done");
+            then.status(200).body(r#"{"state":"done"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("waiter-ok");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            name: "wait-done".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/done", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            assertions: Vec::new(),
+            condition: Some(crate::parser::ConditionConfig {
+                condition_type: "jsonpath".to_string(),
+                path: "$.state".to_string(),
+                equals: serde_json::json!("done"),
+                wait: Some(crate::parser::WaitConfig {
+                    timeout_ms: 5000,
+                    interval_ms: 100,
+                }),
+            }),
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        assert!(result.wait_duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn no_retry_no_condition_passes_normally() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/ok");
+            then.status(200).body(r#"{"result":"ok"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("no-retry");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            name: "plain".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/ok", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        assert_eq!(result.attempts_used, None);
+        assert_eq!(result.wait_duration_ms, None);
     }
 
     #[test]
@@ -1243,6 +1701,7 @@ actions:
             action: Some("posts.getById".to_string()),
             properties: BTreeMap::new(),
             assertions: Vec::new(),
+            condition: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
