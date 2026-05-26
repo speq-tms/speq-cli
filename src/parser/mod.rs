@@ -4,6 +4,23 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitConfig {
+    pub timeout_ms: u64,
+    pub interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionConfig {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub path: String,
+    pub equals: Value,
+    #[serde(default)]
+    pub wait: Option<WaitConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BodyFromFixture {
     pub r#ref: String,
     #[serde(default)]
@@ -51,6 +68,8 @@ pub struct Step {
     pub properties: BTreeMap<String, Value>,
     #[serde(default, rename = "assert")]
     pub assertions: Vec<Assertion>,
+    #[serde(default)]
+    pub condition: Option<ConditionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +243,30 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
 
     for (assert_idx, assertion) in step.assertions.iter().enumerate() {
         validate_assertion(assertion, file_path, assert_idx)?;
+    }
+
+    if let Some(condition) = &step.condition {
+        let allowed_condition_types = ["jsonpath"];
+        if !allowed_condition_types.contains(&condition.condition_type.as_str()) {
+            return Err(format!(
+                "unsupported condition type '{}' in {} step[{}]",
+                condition.condition_type, file_path, idx
+            ));
+        }
+        if condition.path.trim().is_empty() {
+            return Err(format!(
+                "condition.path is required in {} step[{}]",
+                file_path, idx
+            ));
+        }
+        if let Some(wait) = &condition.wait {
+            if wait.timeout_ms < wait.interval_ms {
+                return Err(format!(
+                    "condition.wait.timeoutMs must be >= intervalMs in {} step[{}]",
+                    file_path, idx
+                ));
+            }
+        }
     }
 
     Ok(())

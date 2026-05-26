@@ -22,3 +22,6 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 fake = { version = "2", features = ["derive"] }
 rand = "0.8"
+
+[dev-dependencies]
+httpmock = "0.7"
