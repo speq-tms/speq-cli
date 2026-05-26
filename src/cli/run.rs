@@ -594,6 +594,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     let runtime_paths = RuntimePaths {
         schemas_root: discovered.root.join(manifest.schemas_dir_or_default()),
         modules_root: discovered.root.join(manifest.modules_dir_or_default()),
+        fixtures_root: discovered.root.join(manifest.fixtures_dir_or_default()),
     };
     let files = collect_selected_files(
         &discovered.root,
