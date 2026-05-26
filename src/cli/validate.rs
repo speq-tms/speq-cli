@@ -3,9 +3,27 @@ use crate::cli::files::{collect_suite_init_files, collect_yaml_files};
 use crate::fixtures::load_fixture;
 use crate::manifest::read_manifest;
 use crate::parser::{parse_and_validate_suite_init, parse_and_validate_test};
+use crate::runner::validate_module_content;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+
+fn validate_module_files(modules_root: &Path) -> Vec<String> {
+    let mut errors = Vec::new();
+    if !modules_root.is_dir() {
+        return errors;
+    }
+    for file in collect_yaml_files(modules_root) {
+        match fs::read_to_string(&file) {
+            Ok(content) => {
+                let label = file.to_string_lossy().to_string();
+                errors.extend(validate_module_content(&content, &label));
+            }
+            Err(e) => errors.push(format!("failed to read module {}: {e}", file.display())),
+        }
+    }
+    errors
+}
 
 fn validate_fixture_refs(
     parsed: &crate::parser::TestSpec,
@@ -57,6 +75,7 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
 
     let fixtures_root = discovered.root.join(manifest.fixtures_dir_or_default());
     let schemas_root = discovered.root.join(manifest.schemas_dir_or_default());
+    let modules_root = discovered.root.join(manifest.modules_dir_or_default());
 
     let files = collect_yaml_files(&suites_dir);
     let init_files = collect_suite_init_files(&suites_dir);
@@ -89,6 +108,8 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
             errors.push(err);
         }
     }
+
+    errors.extend(validate_module_files(&modules_root));
 
     if format_json {
         let payload = json!({
