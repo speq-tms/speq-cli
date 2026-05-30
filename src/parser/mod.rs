@@ -1,6 +1,31 @@
+use crate::generator::{validate_gen_in_value, validate_gen_in_variables};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitConfig {
+    pub timeout_ms: u64,
+    pub interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionConfig {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub path: String,
+    pub equals: Value,
+    #[serde(default)]
+    pub wait: Option<WaitConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyFromFixture {
+    pub r#ref: String,
+    #[serde(default)]
+    pub overrides: Option<Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestSpec {
@@ -24,6 +49,8 @@ pub struct TestSpec {
 pub struct Step {
     #[serde(rename = "type")]
     pub step_type: String,
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub method: String,
@@ -33,14 +60,20 @@ pub struct Step {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body: Option<Value>,
+    #[serde(default, rename = "bodyFromFixture")]
+    pub body_from_fixture: Option<BodyFromFixture>,
     #[serde(default)]
     pub r#ref: Option<String>,
     #[serde(default)]
     pub action: Option<String>,
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,
+    #[serde(default, rename = "as")]
+    pub r#as: Option<String>,
     #[serde(default, rename = "assert")]
     pub assertions: Vec<Assertion>,
+    #[serde(default)]
+    pub condition: Option<ConditionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +187,37 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
             if step.url.trim().is_empty() {
                 return Err(format!("step url is required for api step in {} step[{}]", file_path, idx));
             }
+            if step.body.is_some() && step.body_from_fixture.is_some() {
+                return Err(format!(
+                    "step cannot have both 'body' and 'bodyFromFixture' in {} step[{}]",
+                    file_path, idx
+                ));
+            }
+            if let Some(body) = &step.body {
+                let gen_errors = validate_gen_in_value(body, "body", file_path);
+                if !gen_errors.is_empty() {
+                    return Err(format!(
+                        "gen validation failed in {} step[{}]: {}",
+                        file_path, idx, gen_errors.join("; ")
+                    ));
+                }
+            }
+            if let Some(bff) = &step.body_from_fixture {
+                if bff.r#ref.trim().is_empty() {
+                    return Err(format!(
+                        "bodyFromFixture.ref is required in {} step[{}]",
+                        file_path, idx
+                    ));
+                }
+                if let Some(overrides) = &bff.overrides {
+                    if !overrides.is_object() {
+                        return Err(format!(
+                            "bodyFromFixture.overrides must be an object in {} step[{}]",
+                            file_path, idx
+                        ));
+                    }
+                }
+            }
         }
         "use" => {
             let has_ref = step
@@ -172,6 +236,16 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
                     file_path, idx
                 ));
             }
+            if let Some(as_id) = &step.r#as {
+                let valid = !as_id.is_empty()
+                    && as_id.chars().all(|c| c.is_alphanumeric() || c == '_');
+                if !valid {
+                    return Err(format!(
+                        "'as' must be a valid identifier (alphanumeric and underscore only) in {} step[{}]",
+                        file_path, idx
+                    ));
+                }
+            }
         }
         other => {
             return Err(format!(
@@ -183,6 +257,30 @@ fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String>
 
     for (assert_idx, assertion) in step.assertions.iter().enumerate() {
         validate_assertion(assertion, file_path, assert_idx)?;
+    }
+
+    if let Some(condition) = &step.condition {
+        let allowed_condition_types = ["jsonpath"];
+        if !allowed_condition_types.contains(&condition.condition_type.as_str()) {
+            return Err(format!(
+                "unsupported condition type '{}' in {} step[{}]",
+                condition.condition_type, file_path, idx
+            ));
+        }
+        if condition.path.trim().is_empty() {
+            return Err(format!(
+                "condition.path is required in {} step[{}]",
+                file_path, idx
+            ));
+        }
+        if let Some(wait) = &condition.wait {
+            if wait.timeout_ms < wait.interval_ms {
+                return Err(format!(
+                    "condition.wait.timeoutMs must be >= intervalMs in {} step[{}]",
+                    file_path, idx
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -212,6 +310,11 @@ pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpe
                 import_idx, file_path
             ));
         }
+    }
+
+    let gen_var_errors = validate_gen_in_variables(&parsed.variables, file_path);
+    if !gen_var_errors.is_empty() {
+        return Err(gen_var_errors.join("; "));
     }
 
     for (i, step) in parsed.setup.iter().enumerate() {

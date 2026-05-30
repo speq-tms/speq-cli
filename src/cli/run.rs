@@ -238,6 +238,7 @@ async fn run_hook_steps(
     vars: &BTreeMap<String, serde_json::Value>,
     runtime_paths: &RuntimePaths,
     imports: &[ImportSpec],
+    retry_config: Option<&crate::manifest::RetryConfig>,
 ) -> Option<HookExecutionResult> {
     if steps.is_empty() {
         return None;
@@ -260,6 +261,7 @@ async fn run_hook_steps(
         base_url,
         vars,
         runtime_paths,
+        retry_config,
     )
     .await;
     let prefixed_steps = result
@@ -594,6 +596,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     let runtime_paths = RuntimePaths {
         schemas_root: discovered.root.join(manifest.schemas_dir_or_default()),
         modules_root: discovered.root.join(manifest.modules_dir_or_default()),
+        fixtures_root: discovered.root.join(manifest.fixtures_dir_or_default()),
     };
     let files = collect_selected_files(
         &discovered.root,
@@ -627,6 +630,8 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             effective_vars.insert(k.clone(), v.clone());
         }
 
+        let retry_cfg = manifest.retry.as_ref();
+
         if !before_all_done.contains(&suite_ctx.suite_key) {
             before_all_done.insert(suite_ctx.suite_key.clone());
             if let Some(step) = run_hook_steps(
@@ -639,6 +644,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &effective_vars,
                 &runtime_paths,
                 &suite_ctx.suite_imports,
+                retry_cfg,
             )
             .await
             {
@@ -679,6 +685,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
+            retry_cfg,
         )
         .await;
 
@@ -709,6 +716,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                     &base_url,
                     &effective_vars,
                     &runtime_paths,
+                    retry_cfg,
                 )
                 .await
             }
@@ -722,6 +730,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &base_url,
                 &effective_vars,
                 &runtime_paths,
+                retry_cfg,
             )
             .await
         };
@@ -748,6 +757,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
+            retry_cfg,
         )
         .await
         {
@@ -797,6 +807,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
+            manifest.retry.as_ref(),
         )
         .await
         {

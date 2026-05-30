@@ -1,6 +1,6 @@
 [package]
 name = "speq-cli"
-version = "0.1.0-alpha.0"
+version = "0.2.0-alpha.1"
 edition = "2021"
 description = "Open-source CLI runtime for speq"
 license = "MIT"
@@ -18,3 +18,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 regex = "1"
 jsonschema = "0.18"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+fake = { version = "2", features = ["derive"] }
+rand = "0.8"
+
+[dev-dependencies]
+httpmock = "0.7"

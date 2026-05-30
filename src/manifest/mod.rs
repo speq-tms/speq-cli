@@ -2,6 +2,42 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryOn {
+    #[serde(default)]
+    pub network_errors: bool,
+    #[serde(default)]
+    pub status_codes: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackoffStrategy {
+    #[default]
+    Fixed,
+    Exponential,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "maxAttempts", default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(rename = "delayMs", default)]
+    pub delay_ms: u64,
+    #[serde(default)]
+    pub backoff: BackoffStrategy,
+    #[serde(rename = "retryOn", default)]
+    pub retry_on: RetryOn,
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
@@ -18,6 +54,10 @@ pub struct Manifest {
     pub schemas_dir: Option<String>,
     #[serde(rename = "modulesDir", default)]
     pub modules_dir: Option<String>,
+    #[serde(rename = "fixturesDir", default)]
+    pub fixtures_dir: Option<String>,
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
 }
 
 impl Manifest {
@@ -50,6 +90,12 @@ impl Manifest {
             .clone()
             .unwrap_or_else(|| "modules".to_string())
     }
+
+    pub fn fixtures_dir_or_default(&self) -> String {
+        self.fixtures_dir
+            .clone()
+            .unwrap_or_else(|| "fixtures".to_string())
+    }
 }
 
 pub fn read_manifest(speq_root: &Path) -> Result<Manifest, String> {
@@ -74,6 +120,14 @@ pub fn read_manifest(speq_root: &Path) -> Result<Manifest, String> {
             "manifest field 'defaultEnvironment' is required: {}",
             manifest_path.display()
         ));
+    }
+    if let Some(retry) = &parsed.retry {
+        if retry.max_attempts == 0 {
+            return Err(format!(
+                "retry.maxAttempts must be > 0 in {}",
+                manifest_path.display()
+            ));
+        }
     }
     Ok(parsed)
 }

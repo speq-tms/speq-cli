@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    types: [closed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,6 +24,10 @@ jobs:
   build-assets:
     name: build ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'v'))
     strategy:
       fail-fast: false
       matrix:
@@ -92,21 +99,35 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "value=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
           else
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine prerelease flag
+        id: prerelease
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.prerelease }}" == "true" ]]; then
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          elif [[ "${tag}" == *"-alpha"* || "${tag}" == *"-beta"* || "${tag}" == *"-rc"* ]]; then
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.value }}
-          PRERELEASE: ${{ inputs.prerelease }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           args=()
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${PRERELEASE}" == "true" ]]; then
+          if [[ "${{ steps.prerelease.outputs.flag }}" == "--prerelease" ]]; then
             args+=(--prerelease)
           fi
           gh release create "$TAG" \
@@ -133,4 +154,3 @@ jobs:
             -f event_type='speq-cli-release' \
             -f "client_payload[tag]=${TAG}" \
             -f "client_payload[source_repo]=${GITHUB_REPOSITORY}"
-

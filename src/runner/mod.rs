@@ -1,4 +1,7 @@
-use crate::parser::{parse_reusable_steps, Assertion, ImportSpec, Step, TestSpec};
+use crate::fixtures::{load_fixture, materialize_fixture};
+use crate::generator::{resolve_gen_values, resolve_gen_variables};
+use crate::manifest::{BackoffStrategy, RetryConfig};
+use crate::parser::{parse_reusable_steps, Assertion, ConditionConfig, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
 use regex::Regex;
 use reqwest::Method;
@@ -8,7 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +58,10 @@ pub struct StepRunResult {
     pub response: Option<HttpResponseInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<AssertionRunResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +85,7 @@ pub struct TestRunResult {
 pub struct RuntimePaths {
     pub schemas_root: PathBuf,
     pub modules_root: PathBuf,
+    pub fixtures_root: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -107,12 +115,15 @@ struct ModuleActionDetailed {
     properties: Vec<String>,
     #[serde(default)]
     steps: Vec<Step>,
+    #[serde(default)]
+    returns: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedAction {
     steps: Vec<Step>,
     required_properties: Vec<String>,
+    returns: Option<HashMap<String, String>>,
 }
 
 fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
@@ -144,6 +155,21 @@ fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
     out
 }
 
+fn render_template_in_value(value: &Value, vars: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(s) => Value::String(render_template(s, vars)),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), render_template_in_value(v, vars));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| render_template_in_value(v, vars)).collect()),
+        other => other.clone(),
+    }
+}
+
 fn json_path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     if path == "$" {
         return Some(root);
@@ -154,6 +180,44 @@ fn json_path_get<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
         current = current.get(part)?;
     }
     Some(current)
+}
+
+fn compute_delay_ms(config: &RetryConfig, attempt: u32) -> u64 {
+    if config.delay_ms == 0 {
+        return 0;
+    }
+    match config.backoff {
+        BackoffStrategy::Fixed => config.delay_ms,
+        BackoffStrategy::Exponential => {
+            let exp = (attempt - 1).min(16) as u32;
+            config.delay_ms.saturating_mul(1u64 << exp)
+        }
+    }
+}
+
+fn check_condition(condition: &ConditionConfig, body: &str) -> bool {
+    match condition.condition_type.as_str() {
+        "jsonpath" => {
+            let Ok(json) = serde_json::from_str::<Value>(body) else {
+                return false;
+            };
+            match json_path_get(&json, &condition.path) {
+                Some(actual) => {
+                    let actual_str = match actual {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let equals_str = match &condition.equals {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    actual_str == equals_str
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn module_alias(import: &ImportSpec) -> String {
@@ -281,10 +345,12 @@ fn resolve_action_steps(
         ModuleActionSpec::Legacy(steps) => ResolvedAction {
             steps,
             required_properties: Vec::new(),
+            returns: None,
         },
         ModuleActionSpec::Detailed(action) => ResolvedAction {
             steps: action.steps,
             required_properties: action.properties,
+            returns: action.returns,
         },
     };
     Ok(resolved)
@@ -337,6 +403,82 @@ fn build_action_vars(
         }
     }
     Ok(action_vars)
+}
+
+fn resolve_returns_expression(
+    expr: &str,
+    id_responses: &HashMap<String, String>,
+) -> Result<Value, String> {
+    let rest = expr.strip_prefix("$steps.").ok_or_else(|| {
+        format!(
+            "module_return_resolution_error: expression '{}' must start with '$steps.'",
+            expr
+        )
+    })?;
+    let (step_id, body_path) = rest.split_once(".response.body.").ok_or_else(|| {
+        format!(
+            "module_return_resolution_error: expression '{}' must follow '$steps.<id>.response.body.<path>' format",
+            expr
+        )
+    })?;
+    let body_str = id_responses.get(step_id).ok_or_else(|| {
+        format!(
+            "module_return_resolution_error: step '{}' has no captured response (ensure the step has an 'id' field and succeeded)",
+            step_id
+        )
+    })?;
+    let json: Value = serde_json::from_str(body_str).map_err(|_| {
+        format!(
+            "module_return_resolution_error: step '{}' response is not valid JSON",
+            step_id
+        )
+    })?;
+    let json_path = format!("$.{}", body_path);
+    json_path_get(&json, &json_path).cloned().ok_or_else(|| {
+        format!(
+            "module_return_resolution_error: path '{}' not found in step '{}' response",
+            body_path, step_id
+        )
+    })
+}
+
+pub fn validate_module_content(content: &str, file_path: &str) -> Vec<String> {
+    let module: ModuleSpec = match serde_yaml::from_str(content) {
+        Ok(m) => m,
+        Err(e) => return vec![format!("invalid module YAML {}: {}", file_path, e)],
+    };
+    let mut errors = Vec::new();
+    for (action_name, action_spec) in &module.actions {
+        if let ModuleActionSpec::Detailed(action) = action_spec {
+            if let Some(returns_map) = &action.returns {
+                let step_ids: std::collections::HashSet<&str> =
+                    action.steps.iter().filter_map(|s| s.id.as_deref()).collect();
+                for (field, expr) in returns_map {
+                    if let Some(rest) = expr.strip_prefix("$steps.") {
+                        if let Some((step_id, _)) = rest.split_once(".response.body.") {
+                            if !step_ids.contains(step_id) {
+                                errors.push(format!(
+                                    "returns expression '{}' in action '{}' of {} references unknown step id '{}' (no step has id: {})",
+                                    field, action_name, file_path, step_id, step_id
+                                ));
+                            }
+                        } else {
+                            errors.push(format!(
+                                "returns expression '{}' in action '{}' of {} has invalid format (expected '$steps.<id>.response.body.<path>')",
+                                field, action_name, file_path
+                            ));
+                        }
+                    } else {
+                        errors.push(format!(
+                            "returns expression '{}' in action '{}' of {} must start with '$steps.'",
+                            field, action_name, file_path
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    errors
 }
 
 fn run_assertions(
@@ -663,8 +805,10 @@ async fn execute_api_step(
     step: &Step,
     runtime_paths: &RuntimePaths,
     cache: &mut RuntimeCaches,
+    retry_config: Option<&RetryConfig>,
 ) -> StepRunResult {
     let step_started = Instant::now();
+
     let method = match Method::from_bytes(step.method.to_ascii_uppercase().as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -677,6 +821,8 @@ async fn execute_api_step(
                 request: None,
                 response: None,
                 assertions: Vec::new(),
+                attempts_used: None,
+                wait_duration_ms: None,
             }
         }
     };
@@ -688,94 +834,290 @@ async fn execute_api_step(
         format!("{}{}", base_url.trim_end_matches('/'), rendered_url)
     };
 
-    let full_url_for_report = full_url.clone();
-    let mut req = client.request(method.clone(), full_url);
     let mut rendered_headers = BTreeMap::new();
     for (k, v) in &step.headers {
         let rendered = render_template(v, vars);
-        rendered_headers.insert(k.clone(), rendered.clone());
-        req = req.header(k, rendered);
-    }
-    let request_body = step.body.clone();
-    if let Some(body) = &step.body {
-        req = req.json(body);
+        rendered_headers.insert(k.clone(), rendered);
     }
 
-    let response = match req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
+    let effective_body: Option<Value> = if let Some(bff) = &step.body_from_fixture {
+        let fixture_path = runtime_paths.fixtures_root.join(&bff.r#ref);
+        match load_fixture(&fixture_path) {
+            Ok(fixture_cfg) => match materialize_fixture(&fixture_cfg, bff.overrides.as_ref()) {
+                Ok(body) => Some(body),
+                Err(e) => {
+                    return StepRunResult {
+                        name: step.name.clone(),
+                        status: "failed".to_string(),
+                        message: e,
+                        response_status: None,
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: None,
+                        response: None,
+                        assertions: Vec::new(),
+                        attempts_used: None,
+                        wait_duration_ms: None,
+                    }
+                }
+            },
+            Err(e) => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message: e,
+                    response_status: None,
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: None,
+                    response: None,
+                    assertions: Vec::new(),
+                    attempts_used: None,
+                    wait_duration_ms: None,
+                }
+            }
+        }
+    } else {
+        step.body.clone()
+    };
+
+    let resolved_body: Option<Value> = if let Some(body) = &effective_body {
+        let (resolved, gen_errors) = resolve_gen_values(body, "body");
+        if !gen_errors.is_empty() {
             return StepRunResult {
                 name: step.name.clone(),
                 status: "failed".to_string(),
-                message: format!("request failed: {}", e),
+                message: gen_errors.join("; "),
                 response_status: None,
                 duration_ms: step_started.elapsed().as_millis(),
-                request: Some(HttpRequestInfo {
-                    method: method.to_string(),
-                    url: full_url_for_report.clone(),
-                    headers: rendered_headers.clone(),
-                    body: request_body.clone(),
-                }),
+                request: None,
                 response: None,
                 assertions: Vec::new(),
-            }
+                attempts_used: None,
+                wait_duration_ms: None,
+            };
         }
-    };
-    let status = response.status().as_u16();
-    let mut response_headers = BTreeMap::new();
-    for (k, v) in response.headers() {
-        response_headers.insert(
-            k.to_string(),
-            v.to_str().unwrap_or("<non-utf8>").to_string(),
-        );
-    }
-    let body = response.text().await.unwrap_or_default();
-    let (assertion_results, assertion_errors) = run_assertions(
-        &step.assertions,
-        status,
-        &body,
-        runtime_paths,
-        &mut cache.schema_cache,
-    );
-    if assertion_errors.is_empty() {
-        StepRunResult {
-            name: step.name.clone(),
-            status: "passed".to_string(),
-            message: format!("OK ({})", status),
-            response_status: Some(status),
-            duration_ms: step_started.elapsed().as_millis(),
-            request: Some(HttpRequestInfo {
-                method: method.to_string(),
-                url: full_url_for_report,
-                headers: rendered_headers,
-                body: request_body,
-            }),
-            response: Some(HttpResponseInfo {
-                status,
-                headers: response_headers,
-                body,
-            }),
-            assertions: assertion_results,
-        }
+        Some(render_template_in_value(&resolved, vars))
     } else {
-        StepRunResult {
-            name: step.name.clone(),
-            status: "failed".to_string(),
-            message: assertion_errors.join("; "),
-            response_status: Some(status),
-            duration_ms: step_started.elapsed().as_millis(),
-            request: Some(HttpRequestInfo {
-                method: method.to_string(),
-                url: full_url_for_report,
-                headers: rendered_headers,
-                body: request_body,
-            }),
-            response: Some(HttpResponseInfo {
-                status,
-                headers: response_headers,
-                body,
-            }),
-            assertions: assertion_results,
+        None
+    };
+
+    let request_info = HttpRequestInfo {
+        method: method.to_string(),
+        url: full_url.clone(),
+        headers: rendered_headers.clone(),
+        body: effective_body.clone(),
+    };
+
+    let effective_retry = retry_config.filter(|c| c.enabled && c.max_attempts > 0);
+    let max_attempts = effective_retry.map(|c| c.max_attempts).unwrap_or(1).max(1);
+
+    let mut total_attempts: u32 = 0;
+    let waiter_start = Instant::now();
+
+    loop {
+        // Retry loop for one HTTP call (with retry on transient failures)
+        enum RequestOutcome {
+            Success { status: u16, resp_headers: BTreeMap<String, String>, body: String },
+            NetworkFail { message: String },
+            StatusRetryExhausted { status: u16, resp_headers: BTreeMap<String, String>, body: String },
+        }
+
+        let mut retry_attempt: u32 = 0;
+
+        let outcome: RequestOutcome = 'retry: loop {
+            retry_attempt += 1;
+            total_attempts += 1;
+
+            let mut req = client.request(method.clone(), full_url.clone());
+            for (k, v) in &rendered_headers {
+                req = req.header(k, v);
+            }
+            if let Some(body) = &resolved_body {
+                req = req.json(body);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let mut resp_headers = BTreeMap::new();
+                    for (k, v) in resp.headers() {
+                        resp_headers.insert(k.to_string(), v.to_str().unwrap_or("<non-utf8>").to_string());
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+
+                    let should_retry_status = effective_retry
+                        .map(|c| c.retry_on.status_codes.contains(&status))
+                        .unwrap_or(false);
+
+                    if should_retry_status && retry_attempt < max_attempts {
+                        let delay = compute_delay_ms(effective_retry.unwrap(), retry_attempt);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        continue 'retry;
+                    }
+
+                    if should_retry_status {
+                        break 'retry RequestOutcome::StatusRetryExhausted { status, resp_headers, body };
+                    } else {
+                        break 'retry RequestOutcome::Success { status, resp_headers, body };
+                    }
+                }
+                Err(e) => {
+                    let should_retry_network = effective_retry
+                        .map(|c| c.retry_on.network_errors)
+                        .unwrap_or(false);
+
+                    if should_retry_network && retry_attempt < max_attempts {
+                        let delay = compute_delay_ms(effective_retry.unwrap(), retry_attempt);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        continue 'retry;
+                    }
+
+                    let msg = if should_retry_network {
+                        format!("retry_exhausted: request failed after {} attempt(s): {}", retry_attempt, e)
+                    } else {
+                        format!("request failed: {}", e)
+                    };
+                    break 'retry RequestOutcome::NetworkFail { message: msg };
+                }
+            }
+        };
+
+        match outcome {
+            RequestOutcome::NetworkFail { message } => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message,
+                    response_status: None,
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: Some(request_info),
+                    response: None,
+                    assertions: Vec::new(),
+                    attempts_used: Some(total_attempts),
+                    wait_duration_ms: None,
+                };
+            }
+            RequestOutcome::StatusRetryExhausted { status, resp_headers, body } => {
+                return StepRunResult {
+                    name: step.name.clone(),
+                    status: "failed".to_string(),
+                    message: format!(
+                        "retry_exhausted: request failed with status {} after {} attempt(s)",
+                        status, total_attempts
+                    ),
+                    response_status: Some(status),
+                    duration_ms: step_started.elapsed().as_millis(),
+                    request: Some(request_info),
+                    response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                    assertions: Vec::new(),
+                    attempts_used: Some(total_attempts),
+                    wait_duration_ms: None,
+                };
+            }
+            RequestOutcome::Success { status, resp_headers, body } => {
+                // Check condition (waiter)
+                if let Some(condition) = &step.condition {
+                    if check_condition(condition, &body) {
+                        // Condition met — run assertions and return
+                        let (assertion_results, assertion_errors) = run_assertions(
+                            &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                        );
+                        let wait_duration = waiter_start.elapsed().as_millis() as u64;
+                        return StepRunResult {
+                            name: step.name.clone(),
+                            status: if assertion_errors.is_empty() { "passed".to_string() } else { "failed".to_string() },
+                            message: if assertion_errors.is_empty() {
+                                format!("OK ({}) — condition met", status)
+                            } else {
+                                assertion_errors.join("; ")
+                            },
+                            response_status: Some(status),
+                            duration_ms: step_started.elapsed().as_millis(),
+                            request: Some(request_info),
+                            response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                            assertions: assertion_results,
+                            attempts_used: Some(total_attempts),
+                            wait_duration_ms: Some(wait_duration),
+                        };
+                    }
+
+                    // Condition not met
+                    if let Some(wait) = &condition.wait {
+                        let elapsed_ms = waiter_start.elapsed().as_millis() as u64;
+                        if elapsed_ms + wait.interval_ms > wait.timeout_ms {
+                            return StepRunResult {
+                                name: step.name.clone(),
+                                status: "failed".to_string(),
+                                message: format!(
+                                    "wait_timeout: condition ({} {} = {}) not met within {}ms",
+                                    condition.condition_type, condition.path, condition.equals, wait.timeout_ms
+                                ),
+                                response_status: Some(status),
+                                duration_ms: step_started.elapsed().as_millis(),
+                                request: Some(request_info),
+                                response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                                assertions: Vec::new(),
+                                attempts_used: Some(total_attempts),
+                                wait_duration_ms: Some(elapsed_ms),
+                            };
+                        }
+                        tokio::time::sleep(Duration::from_millis(wait.interval_ms)).await;
+                        continue; // outer waiter loop
+                    } else {
+                        return StepRunResult {
+                            name: step.name.clone(),
+                            status: "failed".to_string(),
+                            message: format!(
+                                "condition not met: {} at {} (expected {})",
+                                condition.condition_type, condition.path, condition.equals
+                            ),
+                            response_status: Some(status),
+                            duration_ms: step_started.elapsed().as_millis(),
+                            request: Some(request_info),
+                            response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                            assertions: Vec::new(),
+                            attempts_used: Some(total_attempts),
+                            wait_duration_ms: None,
+                        };
+                    }
+                }
+
+                // No condition — run assertions and return
+                let (assertion_results, assertion_errors) = run_assertions(
+                    &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                );
+                let attempts_field = if total_attempts > 1 { Some(total_attempts) } else { None };
+                return if assertion_errors.is_empty() {
+                    StepRunResult {
+                        name: step.name.clone(),
+                        status: "passed".to_string(),
+                        message: format!("OK ({})", status),
+                        response_status: Some(status),
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: Some(request_info),
+                        response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                        assertions: assertion_results,
+                        attempts_used: attempts_field,
+                        wait_duration_ms: None,
+                    }
+                } else {
+                    StepRunResult {
+                        name: step.name.clone(),
+                        status: "failed".to_string(),
+                        message: assertion_errors.join("; "),
+                        response_status: Some(status),
+                        duration_ms: step_started.elapsed().as_millis(),
+                        request: Some(request_info),
+                        response: Some(HttpResponseInfo { status, headers: resp_headers, body }),
+                        assertions: assertion_results,
+                        attempts_used: attempts_field,
+                        wait_duration_ms: None,
+                    }
+                };
+            }
         }
     }
 }
@@ -787,6 +1129,7 @@ pub async fn run_test(
     base_url: &str,
     env_vars: &BTreeMap<String, Value>,
     runtime_paths: &RuntimePaths,
+    retry_config: Option<&RetryConfig>,
 ) -> TestRunResult {
     let started = Instant::now();
     let client = reqwest::Client::new();
@@ -812,8 +1155,26 @@ pub async fn run_test(
     for (k, v) in imported_vars {
         vars.insert(k, v);
     }
-    for (k, v) in &test.variables {
-        vars.insert(k.clone(), v.clone());
+    match resolve_gen_variables(&test.variables) {
+        Ok(resolved_vars) => {
+            for (k, v) in resolved_vars {
+                vars.insert(k, v);
+            }
+        }
+        Err(gen_errors) => {
+            return TestRunResult {
+                id: test.id.clone(),
+                title: test.title.clone(),
+                tags: test.tags.clone(),
+                file: rel_file,
+                status: "failed".to_string(),
+                duration_ms: started.elapsed().as_millis(),
+                errors: gen_errors,
+                steps: Vec::new(),
+                setup_steps: Vec::new(),
+                teardown_steps: Vec::new(),
+            };
+        }
     }
 
     let mut step_results = Vec::new();
@@ -821,7 +1182,7 @@ pub async fn run_test(
 
     run_step_group(
         &client,
-        &vars,
+        &mut vars,
         base_url,
         &test.setup,
         test_file,
@@ -830,11 +1191,12 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
     run_step_group(
         &client,
-        &vars,
+        &mut vars,
         base_url,
         &test.steps,
         test_file,
@@ -843,11 +1205,12 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
     run_step_group(
         &client,
-        &vars,
+        &mut vars,
         base_url,
         &test.cleanup,
         test_file,
@@ -856,6 +1219,7 @@ pub async fn run_test(
         &mut cache,
         &mut step_results,
         &mut errors,
+        retry_config,
     )
     .await;
 
@@ -879,7 +1243,7 @@ pub async fn run_test(
 
 async fn run_step_group(
     client: &reqwest::Client,
-    vars: &BTreeMap<String, Value>,
+    vars: &mut BTreeMap<String, Value>,
     base_url: &str,
     steps: &[Step],
     test_file: &Path,
@@ -888,6 +1252,7 @@ async fn run_step_group(
     cache: &mut RuntimeCaches,
     step_results: &mut Vec<StepRunResult>,
     errors: &mut Vec<String>,
+    retry_config: Option<&RetryConfig>,
 ) {
     for step in steps {
         if step.step_type == "use" {
@@ -908,12 +1273,50 @@ async fn run_step_group(
                                     request: None,
                                     response: None,
                                     assertions: Vec::new(),
+                                    attempts_used: None,
+                                    wait_duration_ms: None,
                                 });
                                 continue;
                             }
                         };
 
-                        for action_step in resolved_action.steps {
+                        let action_steps = resolved_action.steps;
+                        let action_returns = resolved_action.returns;
+                        let step_as = step.r#as.clone();
+
+                        // Check for conflicts before executing any steps.
+                        if action_returns.is_some() {
+                            if let Some(as_key) = &step_as {
+                                let prefix = format!("{}.", as_key);
+                                let conflict = vars.contains_key(as_key.as_str())
+                                    || vars.keys().any(|k| k.starts_with(&prefix));
+                                if conflict {
+                                    let msg = format!(
+                                        "module_output_conflict: '{}' is already bound in context (step '{}')",
+                                        as_key, step.name
+                                    );
+                                    errors.push(msg.clone());
+                                    step_results.push(StepRunResult {
+                                        name: step.name.clone(),
+                                        status: "failed".to_string(),
+                                        message: msg,
+                                        response_status: None,
+                                        duration_ms: 0,
+                                        request: None,
+                                        response: None,
+                                        assertions: Vec::new(),
+                                        attempts_used: None,
+                                        wait_duration_ms: None,
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let mut id_responses: HashMap<String, String> = HashMap::new();
+                        let mut action_had_failure = false;
+
+                        for action_step in &action_steps {
                             if action_step.step_type == "use" {
                                 let msg = format!(
                                     "nested 'use' in module action is not supported yet (step '{}')",
@@ -921,7 +1324,7 @@ async fn run_step_group(
                                 );
                                 errors.push(msg.clone());
                                 step_results.push(StepRunResult {
-                                    name: action_step.name,
+                                    name: action_step.name.clone(),
                                     status: "failed".to_string(),
                                     message: msg,
                                     response_status: None,
@@ -929,16 +1332,52 @@ async fn run_step_group(
                                     request: None,
                                     response: None,
                                     assertions: Vec::new(),
+                                    attempts_used: None,
+                                    wait_duration_ms: None,
                                 });
+                                action_had_failure = true;
                                 continue;
                             }
                             let result =
-                                execute_api_step(client, &action_vars, base_url, &action_step, runtime_paths, cache)
+                                execute_api_step(client, &action_vars, base_url, action_step, runtime_paths, cache, retry_config)
                                     .await;
+                            if let (Some(step_id), Some(resp)) = (&action_step.id, &result.response) {
+                                id_responses.insert(step_id.clone(), resp.body.clone());
+                            }
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
+                                action_had_failure = true;
                             }
                             step_results.push(result);
+                        }
+
+                        // Resolve and bind returns only when all steps passed.
+                        if !action_had_failure {
+                            if let (Some(returns_map), Some(as_key)) = (&action_returns, &step_as) {
+                                for (field_name, expr) in returns_map {
+                                    match resolve_returns_expression(expr, &id_responses) {
+                                        Ok(value) => {
+                                            vars.insert(format!("{}.{}", as_key, field_name), value);
+                                        }
+                                        Err(msg) => {
+                                            errors.push(msg.clone());
+                                            step_results.push(StepRunResult {
+                                                name: step.name.clone(),
+                                                status: "failed".to_string(),
+                                                message: msg,
+                                                response_status: None,
+                                                duration_ms: 0,
+                                                request: None,
+                                                response: None,
+                                                assertions: Vec::new(),
+                                                attempts_used: None,
+                                                wait_duration_ms: None,
+                                            });
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(msg) => {
@@ -952,6 +1391,8 @@ async fn run_step_group(
                             request: None,
                             response: None,
                             assertions: Vec::new(),
+                            attempts_used: None,
+                            wait_duration_ms: None,
                         });
                     }
                 }
@@ -965,7 +1406,7 @@ async fn run_step_group(
                     Ok(reusable_steps) => {
                         for reusable in reusable_steps {
                             let result =
-                                execute_api_step(client, vars, base_url, &reusable, runtime_paths, cache).await;
+                                execute_api_step(client, vars, base_url, &reusable, runtime_paths, cache, retry_config).await;
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
                             }
@@ -983,6 +1424,8 @@ async fn run_step_group(
                             request: None,
                             response: None,
                             assertions: Vec::new(),
+                            attempts_used: None,
+                            wait_duration_ms: None,
                         });
                     }
                 },
@@ -998,11 +1441,13 @@ async fn run_step_group(
                         request: None,
                         response: None,
                         assertions: Vec::new(),
+                        attempts_used: None,
+                        wait_duration_ms: None,
                     });
                 }
             }
         } else {
-            let result = execute_api_step(client, vars, base_url, step, runtime_paths, cache).await;
+            let result = execute_api_step(client, vars, base_url, step, runtime_paths, cache, retry_config).await;
             if result.status == "failed" {
                 errors.push(result.message.clone());
             }
@@ -1041,6 +1486,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
 
         let assertions = vec![Assertion {
@@ -1062,6 +1508,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             schemas_root: root.join("schemas"),
             modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
         };
         let assertions = vec![Assertion {
             assertion_type: "schema".to_string(),
@@ -1104,6 +1551,7 @@ actions:
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
         let imports = vec![ImportSpec {
             module: "auth".to_string(),
@@ -1111,20 +1559,721 @@ actions:
         }];
         let step = Step {
             step_type: "use".to_string(),
+            id: None,
             name: "login".to_string(),
             method: String::new(),
             url: String::new(),
             headers: BTreeMap::new(),
             body: None,
+            body_from_fixture: None,
             r#ref: None,
             action: Some("auth.login".to_string()),
             properties: BTreeMap::new(),
+            r#as: None,
             assertions: Vec::new(),
+            condition: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
         assert_eq!(resolved.steps.len(), 1);
         assert_eq!(resolved.steps[0].step_type, "api");
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_nth_attempt() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Minimal HTTP server: returns 503 on first 2 calls, then 200
+        let fail_times = 2u32;
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let call_count_srv = call_count.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            for _ in 0..10u32 {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let n = call_count_srv.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if n < fail_times {
+                    (503u16, r#"{"error":"unavailable"}"#)
+                } else {
+                    (200u16, r#"{"ok":true}"#)
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let root = make_tmp_dir("retry-ok");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let retry = crate::manifest::RetryConfig {
+            enabled: true,
+            max_attempts: 5,
+            delay_ms: 0,
+            backoff: crate::manifest::BackoffStrategy::Fixed,
+            retry_on: crate::manifest::RetryOn {
+                network_errors: false,
+                status_codes: vec![503],
+            },
+        };
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "test retry".to_string(),
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:{}/retry-ok", port),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        // 2 failures + 1 success = 3 total attempts
+        assert_eq!(result.attempts_used, Some(3));
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_returns_error() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/always-fail");
+            then.status(429).body("rate limited");
+        })
+        .await;
+
+        let root = make_tmp_dir("retry-exhausted");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let retry = crate::manifest::RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            delay_ms: 0,
+            backoff: crate::manifest::BackoffStrategy::Fixed,
+            retry_on: crate::manifest::RetryOn {
+                network_errors: false,
+                status_codes: vec![429],
+            },
+        };
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "exhausted".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/always-fail", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("retry_exhausted"), "expected retry_exhausted, got: {}", result.message);
+        assert_eq!(result.attempts_used, Some(3));
+    }
+
+    #[tokio::test]
+    async fn waiter_timeout_returns_error() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/status");
+            then.status(200).body(r#"{"state":"pending"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("waiter-timeout");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "waiter".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/status", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: Some(crate::parser::ConditionConfig {
+                condition_type: "jsonpath".to_string(),
+                path: "$.state".to_string(),
+                equals: serde_json::json!("done"),
+                wait: Some(crate::parser::WaitConfig {
+                    timeout_ms: 200,
+                    interval_ms: 50,
+                }),
+            }),
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("wait_timeout"), "expected wait_timeout, got: {}", result.message);
+        assert!(result.wait_duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn waiter_succeeds_when_condition_met() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/done");
+            then.status(200).body(r#"{"state":"done"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("waiter-ok");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "wait-done".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/done", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: Some(crate::parser::ConditionConfig {
+                condition_type: "jsonpath".to_string(),
+                path: "$.state".to_string(),
+                equals: serde_json::json!("done"),
+                wait: Some(crate::parser::WaitConfig {
+                    timeout_ms: 5000,
+                    interval_ms: 100,
+                }),
+            }),
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        assert!(result.wait_duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn no_retry_no_condition_passes_normally() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(GET).path("/ok");
+            then.status(200).body(r#"{"result":"ok"}"#);
+        })
+        .await;
+
+        let root = make_tmp_dir("no-retry");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+        let step = crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "plain".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/ok", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+        };
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
+        assert_eq!(result.attempts_used, None);
+        assert_eq!(result.wait_duration_ms, None);
+    }
+
+    #[test]
+    fn resolve_returns_expression_resolves_nested_path() {
+        let mut id_responses = HashMap::new();
+        id_responses.insert(
+            "login_call".to_string(),
+            r#"{"access_token":"tok123","user":{"id":42}}"#.to_string(),
+        );
+        let token =
+            resolve_returns_expression("$steps.login_call.response.body.access_token", &id_responses)
+                .expect("resolve token");
+        assert_eq!(token, serde_json::json!("tok123"));
+
+        let user_id =
+            resolve_returns_expression("$steps.login_call.response.body.user.id", &id_responses)
+                .expect("resolve user id");
+        assert_eq!(user_id, serde_json::json!(42));
+    }
+
+    #[test]
+    fn resolve_returns_expression_missing_step_id_is_error() {
+        let id_responses: HashMap<String, String> = HashMap::new();
+        let result =
+            resolve_returns_expression("$steps.nonexistent.response.body.token", &id_responses);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("module_return_resolution_error"),
+            "expected module_return_resolution_error"
+        );
+    }
+
+    #[test]
+    fn resolve_returns_expression_bad_format_is_error() {
+        let id_responses: HashMap<String, String> = HashMap::new();
+        let result = resolve_returns_expression("bad_expression_no_prefix", &id_responses);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("module_return_resolution_error"));
+    }
+
+    #[test]
+    fn resolve_returns_expression_missing_path_is_error() {
+        let mut id_responses = HashMap::new();
+        id_responses.insert("my_step".to_string(), r#"{"name":"test"}"#.to_string());
+        let result =
+            resolve_returns_expression("$steps.my_step.response.body.nonexistent.deep", &id_responses);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("module_return_resolution_error"));
+    }
+
+    #[tokio::test]
+    async fn module_returns_auth_flow_binds_token() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/auth/login");
+                then.status(200)
+                    .body(r#"{"access_token":"tok123","user":{"id":42}}"#);
+            })
+            .await;
+
+        let root = make_tmp_dir("module-returns-auth");
+        let modules_root = root.join("modules");
+        fs::create_dir_all(&modules_root).expect("modules dir");
+
+        fs::write(
+            modules_root.join("auth.yaml"),
+            format!(
+                r#"
+actions:
+  login:
+    properties:
+      - user
+      - pass
+    steps:
+      - type: api
+        id: login_call
+        name: "login api call"
+        method: POST
+        url: "{}/auth/login"
+    returns:
+      token: "$steps.login_call.response.body.access_token"
+      userId: "$steps.login_call.response.body.user.id"
+"#,
+                server.base_url()
+            ),
+        )
+        .expect("write module");
+
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: modules_root.clone(),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let imports = vec![ImportSpec {
+            module: "auth".to_string(),
+            alias: Some("auth".to_string()),
+        }];
+
+        let mut props = BTreeMap::new();
+        props.insert("user".to_string(), serde_json::json!("john"));
+        props.insert("pass".to_string(), serde_json::json!("secret"));
+
+        let use_step = Step {
+            step_type: "use".to_string(),
+            id: None,
+            name: "auth login".to_string(),
+            method: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: Some("auth.login".to_string()),
+            properties: props,
+            r#as: Some("login".to_string()),
+            assertions: Vec::new(),
+            condition: None,
+        };
+
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            "",
+            &[use_step],
+            std::path::Path::new("/tmp/test.yaml"),
+            &imports,
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert_eq!(vars.get("login.token"), Some(&serde_json::json!("tok123")));
+        assert_eq!(vars.get("login.userId"), Some(&serde_json::json!(42)));
+    }
+
+    #[tokio::test]
+    async fn module_returns_create_entity_reuse_id() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/entities");
+                then.status(201).body(r#"{"id":"ent-456","name":"test"}"#);
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/entities/ent-456");
+                then.status(200).body(r#"{"id":"ent-456","status":"active"}"#);
+            })
+            .await;
+
+        let root = make_tmp_dir("module-returns-entity");
+        let modules_root = root.join("modules");
+        fs::create_dir_all(&modules_root).expect("modules dir");
+
+        fs::write(
+            modules_root.join("entities.yaml"),
+            format!(
+                r#"
+actions:
+  create:
+    steps:
+      - type: api
+        id: create_call
+        name: "create entity"
+        method: POST
+        url: "{}/entities"
+    returns:
+      id: "$steps.create_call.response.body.id"
+"#,
+                server.base_url()
+            ),
+        )
+        .expect("write module");
+
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: modules_root.clone(),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let imports = vec![ImportSpec {
+            module: "entities".to_string(),
+            alias: Some("entities".to_string()),
+        }];
+
+        let create_step = Step {
+            step_type: "use".to_string(),
+            id: None,
+            name: "create entity".to_string(),
+            method: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: Some("entities.create".to_string()),
+            properties: BTreeMap::new(),
+            r#as: Some("entity".to_string()),
+            assertions: Vec::new(),
+            condition: None,
+        };
+
+        let get_step = Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "get created entity".to_string(),
+            method: "GET".to_string(),
+            url: format!("{}/entities/{{{{entity.id}}}}", server.base_url()),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+        };
+
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            "",
+            &[create_step, get_step],
+            std::path::Path::new("/tmp/test.yaml"),
+            &imports,
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert_eq!(vars.get("entity.id"), Some(&serde_json::json!("ent-456")));
+        let get_result = step_results.iter().find(|r| r.name == "get created entity").unwrap();
+        assert_eq!(get_result.status, "passed", "get step should pass: {}", get_result.message);
+    }
+
+    #[tokio::test]
+    async fn module_use_without_returns_works_unchanged() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/status");
+                then.status(200).body(r#"{"ok":true}"#);
+            })
+            .await;
+
+        let root = make_tmp_dir("module-no-returns");
+        let modules_root = root.join("modules");
+        fs::create_dir_all(&modules_root).expect("modules dir");
+
+        fs::write(
+            modules_root.join("health.yaml"),
+            format!(
+                r#"
+actions:
+  check:
+    steps:
+      - type: api
+        name: "health check"
+        method: GET
+        url: "{}/status"
+"#,
+                server.base_url()
+            ),
+        )
+        .expect("write module");
+
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: modules_root.clone(),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let imports = vec![ImportSpec {
+            module: "health".to_string(),
+            alias: Some("health".to_string()),
+        }];
+
+        let use_step = Step {
+            step_type: "use".to_string(),
+            id: None,
+            name: "check health".to_string(),
+            method: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: Some("health.check".to_string()),
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+        };
+
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            "",
+            &[use_step],
+            std::path::Path::new("/tmp/test.yaml"),
+            &imports,
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert!(vars.is_empty(), "expected no vars to be bound after legacy use");
+    }
+
+    #[tokio::test]
+    async fn module_returns_as_conflict_produces_error() {
+        let root = make_tmp_dir("module-returns-conflict");
+        let modules_root = root.join("modules");
+        fs::create_dir_all(&modules_root).expect("modules dir");
+
+        fs::write(
+            modules_root.join("auth.yaml"),
+            r#"
+actions:
+  login:
+    steps:
+      - type: api
+        id: login_call
+        name: "login"
+        method: GET
+        url: "/login"
+    returns:
+      token: "$steps.login_call.response.body.token"
+"#,
+        )
+        .expect("write module");
+
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: modules_root.clone(),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert("login.token".to_string(), serde_json::json!("existing"));
+
+        let imports = vec![ImportSpec {
+            module: "auth".to_string(),
+            alias: Some("auth".to_string()),
+        }];
+
+        let use_step = Step {
+            step_type: "use".to_string(),
+            id: None,
+            name: "auth login".to_string(),
+            method: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: Some("auth.login".to_string()),
+            properties: BTreeMap::new(),
+            r#as: Some("login".to_string()),
+            assertions: Vec::new(),
+            condition: None,
+        };
+
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            "",
+            &[use_step],
+            std::path::Path::new("/tmp/test.yaml"),
+            &imports,
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(!errors.is_empty(), "expected a conflict error");
+        assert!(
+            errors[0].contains("module_output_conflict"),
+            "expected module_output_conflict, got: {}",
+            errors[0]
+        );
+        assert_eq!(
+            vars.get("login.token"),
+            Some(&serde_json::json!("existing")),
+            "existing value must not be overwritten"
+        );
     }
 
     #[test]
@@ -1152,6 +2301,7 @@ actions:
         let runtime_paths = RuntimePaths {
             schemas_root,
             modules_root,
+            fixtures_root: root.join("fixtures"),
         };
         let imports = vec![ImportSpec {
             module: "posts".to_string(),
@@ -1159,15 +2309,19 @@ actions:
         }];
         let step = Step {
             step_type: "use".to_string(),
+            id: None,
             name: "get by id".to_string(),
             method: String::new(),
             url: String::new(),
             headers: BTreeMap::new(),
             body: None,
+            body_from_fixture: None,
             r#ref: None,
             action: Some("posts.getById".to_string()),
             properties: BTreeMap::new(),
+            r#as: None,
             assertions: Vec::new(),
+            condition: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
