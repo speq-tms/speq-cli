@@ -15,6 +15,8 @@ Core runtime is implemented in Rust.
 
 ## Current commands
 
+- `speq help`
+- `speq version`
 - `speq init --mode in-repo|test-repo`
 - `speq list [--speq-root <path>] [--format json]`
 - `speq validate [--speq-root <path>] [--format json]`
@@ -84,6 +86,17 @@ brew tap speq-tms/tap https://github.com/speq-tms/homebrew-tap
 brew install speq
 ```
 
+## Manual install from release artifacts
+
+Download the archive for your platform from the GitHub Release, verify the matching `.sha256` file, then place the `speq` binary on your `PATH`.
+
+| Platform | Artifact |
+| --- | --- |
+| Linux x86_64 | `speq-linux-x86_64.tar.gz` |
+| macOS Intel | `speq-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `speq-darwin-aarch64.tar.gz` |
+| Windows x86_64 | `speq-windows-x86_64.zip` |
+
 ## Release packaging
 
 Tag-driven release assets are built by `.github/workflows/release.yml`:
@@ -91,6 +104,7 @@ Tag-driven release assets are built by `.github/workflows/release.yml`:
 - `speq-linux-x86_64.tar.gz`
 - `speq-darwin-x86_64.tar.gz`
 - `speq-darwin-aarch64.tar.gz`
+- `speq-windows-x86_64.zip`
 - matching `.sha256` files for each archive
 
 Homebrew formula updates are documented in `docs/HOMEBREW_RELEASE.md`.
@@ -99,6 +113,6 @@ Homebrew formula updates are documented in `docs/HOMEBREW_RELEASE.md`.
 
 MVP CLI is functionally complete for OSS alpha:
 
-- init/list/validate/run/report/doctor;
+- help/version/init/list/validate/run/report/doctor;
 - dual layout support (in-repo/test-repo);
 - report outputs (summary/allure/all) with contract regression tests.
