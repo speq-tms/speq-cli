@@ -48,6 +48,8 @@ fn build_run_options_keeps_output_flag() {
         Some("smoke,api".to_string()),
         Some("summary".to_string()),
         Some("reports/results/custom.json".to_string()),
+        false,
+        None,
     )
     .expect("options");
     assert_eq!(opts.tags, vec!["smoke".to_string(), "api".to_string()]);

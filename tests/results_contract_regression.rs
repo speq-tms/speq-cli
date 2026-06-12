@@ -30,6 +30,7 @@ fn summary_report_matches_results_v1_schema() {
             duration_ms: 5,
             message: None,
         }],
+        coverage: None,
     };
     let instance = serde_json::to_value(summary).expect("summary to json");
 
