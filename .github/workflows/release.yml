@@ -44,6 +44,10 @@ jobs:
             platform: darwin
             arch: aarch64
             target: aarch64-apple-darwin
+          - os: windows-latest
+            platform: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -58,7 +62,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} --locked || cargo build --release --target ${{ matrix.target }}
 
-      - name: Package release asset
+      - name: Package Unix release asset
+        if: matrix.platform != 'windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -67,12 +72,28 @@ jobs:
           chmod +x dist/speq
           tar -czf "dist/speq-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" -C dist speq
 
-      - name: Generate checksum
+      - name: Generate Unix checksum
+        if: matrix.platform != 'windows'
         shell: bash
         run: |
           set -euo pipefail
           cd dist
           shasum -a 256 "speq-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" > "speq-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256"
+
+      - name: Package Windows release asset
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/speq.exe" "dist/speq.exe"
+          Compress-Archive -Path "dist/speq.exe" -DestinationPath "dist/speq-windows-x86_64.zip" -Force
+
+      - name: Generate Windows checksum
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/speq-windows-x86_64.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  speq-windows-x86_64.zip" | Out-File -FilePath "dist/speq-windows-x86_64.zip.sha256" -Encoding utf8
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -81,6 +102,8 @@ jobs:
           path: |
             dist/speq-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
             dist/speq-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+            dist/speq-${{ matrix.platform }}-${{ matrix.arch }}.zip
+            dist/speq-${{ matrix.platform }}-${{ matrix.arch }}.zip.sha256
 
   publish-release:
     name: publish github release
@@ -134,6 +157,8 @@ jobs:
             -R "$REPO" \
             dist/speq-*.tar.gz \
             dist/speq-*.tar.gz.sha256 \
+            dist/speq-*.zip \
+            dist/speq-*.zip.sha256 \
             --title "speq-cli $TAG" \
             --generate-notes \
             "${args[@]}"
