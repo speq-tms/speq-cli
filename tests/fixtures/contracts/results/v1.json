@@ -8,7 +8,7 @@
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["passed", "failed"]
+      "enum": ["passed", "failed", "pending"]
     },
     "startedAtMs": {
       "type": "integer",
@@ -34,6 +34,14 @@
         "total": {
           "type": "integer",
           "minimum": 0
+        },
+        "pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -50,7 +58,7 @@
           },
           "status": {
             "type": "string",
-            "enum": ["passed", "failed"]
+            "enum": ["passed", "failed", "pending", "error"]
           },
           "message": {
             "type": "string"

@@ -1132,6 +1132,23 @@ pub async fn run_test(
     retry_config: Option<&RetryConfig>,
 ) -> TestRunResult {
     let started = Instant::now();
+
+    // ATDD: entire test is pending — skip without executing HTTP requests.
+    if test.status.as_deref() == Some("pending") {
+        return TestRunResult {
+            id: test.id.clone(),
+            title: test.title.clone(),
+            tags: test.tags.clone(),
+            file: rel_file,
+            status: "pending".to_string(),
+            duration_ms: started.elapsed().as_millis(),
+            errors: Vec::new(),
+            steps: Vec::new(),
+            setup_steps: Vec::new(),
+            teardown_steps: Vec::new(),
+        };
+    }
+
     let client = reqwest::Client::new();
     let mut cache = RuntimeCaches::default();
     let mut vars = env_vars.clone();
@@ -1241,6 +1258,35 @@ pub async fn run_test(
     }
 }
 
+fn step_references_pending(step: &Step, pending_step_names: &std::collections::HashSet<String>) -> bool {
+    if pending_step_names.is_empty() {
+        return false;
+    }
+    // Check all string fields that could contain {{ steps.<name>.response.* }} templates.
+    let check_str = |s: &str| -> bool {
+        pending_step_names.iter().any(|name| {
+            let prefix = format!("steps.{}.", name);
+            s.contains(&format!("{{{{ {} ", prefix.trim_end_matches('.')))
+                || s.contains(&format!("{{{{{}", prefix))
+                || s.contains(&format!("{{{{ {}", prefix))
+        })
+    };
+    if check_str(&step.url) {
+        return true;
+    }
+    for v in step.headers.values() {
+        if check_str(v) {
+            return true;
+        }
+    }
+    if let Some(body) = &step.body {
+        if check_str(&body.to_string()) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn run_step_group(
     client: &reqwest::Client,
     vars: &mut BTreeMap<String, Value>,
@@ -1254,7 +1300,27 @@ async fn run_step_group(
     errors: &mut Vec<String>,
     retry_config: Option<&RetryConfig>,
 ) {
+    let mut pending_step_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for step in steps {
+        // ATDD: skip steps marked as pending or that depend on a pending step's output.
+        let is_pending = step.status.as_deref() == Some("pending")
+            || step_references_pending(step, &pending_step_names);
+        if is_pending {
+            pending_step_names.insert(step.name.clone());
+            step_results.push(StepRunResult {
+                name: step.name.clone(),
+                status: "pending".to_string(),
+                message: "[ATDD: pending]".to_string(),
+                response_status: None,
+                duration_ms: 0,
+                request: None,
+                response: None,
+                assertions: Vec::new(),
+                attempts_used: None,
+                wait_duration_ms: None,
+            });
+            continue;
+        }
         if step.step_type == "use" {
             let action = step.action.as_deref().map(str::trim).unwrap_or_default();
             if !action.is_empty() {
@@ -1572,6 +1638,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
@@ -1645,6 +1712,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
         let mut cache = RuntimeCaches::default();
         let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
@@ -1697,6 +1765,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
         let mut cache = RuntimeCaches::default();
         let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
@@ -1747,6 +1816,7 @@ actions:
                     interval_ms: 50,
                 }),
             }),
+            status: None,
         };
         let mut cache = RuntimeCaches::default();
         let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
@@ -1797,6 +1867,7 @@ actions:
                     interval_ms: 100,
                 }),
             }),
+            status: None,
         };
         let mut cache = RuntimeCaches::default();
         let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
@@ -1838,6 +1909,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
         let mut cache = RuntimeCaches::default();
         let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
@@ -1966,6 +2038,7 @@ actions:
             r#as: Some("login".to_string()),
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
 
         let mut step_results = Vec::new();
@@ -2061,6 +2134,7 @@ actions:
             r#as: Some("entity".to_string()),
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
 
         let get_step = Step {
@@ -2078,6 +2152,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
 
         let mut step_results = Vec::new();
@@ -2165,6 +2240,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
 
         let mut step_results = Vec::new();
@@ -2242,6 +2318,7 @@ actions:
             r#as: Some("login".to_string()),
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
 
         let mut step_results = Vec::new();
@@ -2322,6 +2399,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            status: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");

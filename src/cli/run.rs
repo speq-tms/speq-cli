@@ -54,6 +54,10 @@ pub struct SummaryTotals {
     pub passed: usize,
     pub failed: usize,
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +257,7 @@ async fn run_hook_steps(
         setup: Vec::new(),
         steps: steps.to_vec(),
         cleanup: Vec::new(),
+        status: None,
     };
     let result = run_test(
         &hook_spec,
@@ -495,12 +500,23 @@ pub fn write_allure_results(allure_dir: &Path, run_id: &str, results: &[TestRunR
             .collect::<Result<Vec<_>, _>>()?;
 
         let test_uuid = format!("{}-{}", run_id, test_idx);
+        let allure_status = if test.status == "pending" { "skipped" } else { test.status.as_str() };
+        let allure_name = if test.status == "pending" {
+            format!("[ATDD: pending] {}", test.title)
+        } else {
+            test.title.clone()
+        };
         let payload = json!({
             "uuid": test_uuid,
             "historyId": format!("{}::{}", test.id, test.file),
-            "name": test.title,
-            "status": test.status,
+            "name": allure_name,
+            "status": allure_status,
             "stage": "finished",
+            "statusDetails": if test.status == "pending" {
+                json!({ "message": "[ATDD: pending] Test marked as pending — not yet implemented." })
+            } else {
+                json!({ "message": test.errors.first().unwrap_or(&String::new()) })
+            },
             "labels": build_suite_labels(&test.file),
             "steps": body_steps
         });
@@ -578,6 +594,22 @@ pub fn build_run_options(
         report_mode,
         summary_output,
     })
+}
+
+fn collect_pending_items(results: &[TestRunResult]) -> Vec<String> {
+    let mut items = Vec::new();
+    for r in results {
+        if r.status == "pending" {
+            items.push(format!("[{}] {}", r.file, r.title));
+        } else {
+            for step in &r.steps {
+                if step.status == "pending" {
+                    items.push(format!("[{}#step:{}] {}", r.file, step.name, step.name));
+                }
+            }
+        }
+    }
+    items
 }
 
 pub async fn command_run(options: RunOptions) -> Result<i32, String> {
@@ -832,9 +864,11 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     }
 
     let passed = results.iter().filter(|x| x.status == "passed").count();
-    let failed = results.len() - passed;
+    let pending = results.iter().filter(|x| x.status == "pending").count();
+    let failed = results.iter().filter(|x| x.status == "failed").count();
+    let error_count = results.iter().filter(|x| x.status == "error").count();
     let duration_ms = run_started.elapsed().as_millis();
-    let status = if failed == 0 { "passed" } else { "failed" };
+    let status = if failed == 0 && error_count == 0 { "passed" } else { "failed" };
 
     let reports_root = discovered
         .root
@@ -864,12 +898,14 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
 
     let summary_struct = SummaryReport {
         status: status.to_string(),
-        started_at_ms: started_at_ms,
+        started_at_ms,
         duration_ms,
         totals: SummaryTotals {
             passed,
             failed,
             total: results.len(),
+            pending: if pending > 0 { Some(pending) } else { None },
+            error: if error_count > 0 { Some(error_count) } else { None },
         },
         tests: summary_tests,
     };
@@ -896,12 +932,28 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
         }
     };
 
+    // Print PENDING section if there are any pending tests or steps.
+    let pending_items = collect_pending_items(&results);
+    if !pending_items.is_empty() {
+        eprintln!("\nPENDING:");
+        for item in &pending_items {
+            eprintln!("  - {}", item);
+        }
+        eprintln!();
+    }
+
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-          "ok": failed == 0,
+          "ok": failed == 0 && error_count == 0,
           "status": status,
-          "totals": { "passed": passed, "failed": failed, "total": results.len() },
+          "totals": {
+            "passed": passed,
+            "pending": pending,
+            "failed": failed,
+            "error": error_count,
+            "total": results.len()
+          },
           "reports": {
             "summary": if summary_generated { Some(summary_path.to_string_lossy().to_string()) } else { None::<String> },
             "allure": if allure_generated { Some(allure_dir.to_string_lossy().to_string()) } else { None::<String> }
@@ -910,6 +962,6 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
         .map_err(|e| format!("internal: failed to encode json: {e}"))?
     );
 
-    Ok(if failed == 0 { 0 } else { 1 })
+    Ok(if failed == 0 && error_count == 0 { 0 } else { 1 })
 }
 
