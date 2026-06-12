@@ -21,6 +21,8 @@ fn summary_report_matches_results_v1_schema() {
             passed: 1,
             failed: 0,
             total: 1,
+            pending: None,
+            error: None,
         },
         tests: vec![SummaryTestRecord {
             id: "smoke.health".to_string(),
