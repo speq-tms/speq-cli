@@ -1,5 +1,6 @@
 use crate::cli::discovery::discover_speq_root;
 use crate::cli::files::{collect_suite_init_files, collect_yaml_files, relative_unix};
+use crate::coverage::{compute_coverage, load_openapi_endpoints, CoverageReport};
 use crate::manifest::{read_manifest, Manifest};
 use crate::parser::{
     parse_and_validate_suite_init, parse_and_validate_test, ImportSpec, Step, SuiteInitSpec, TestSpec,
@@ -28,6 +29,10 @@ pub struct RunOptions {
     pub tags: Vec<String>,
     pub report_mode: ReportMode,
     pub summary_output: Option<String>,
+    /// CLI flag: --coverage (enables coverage even if not set in manifest)
+    pub coverage_enabled: bool,
+    /// CLI flag: --openapi <path> (overrides manifest coverage.openapi)
+    pub openapi_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +59,10 @@ pub struct SummaryTotals {
     pub passed: usize,
     pub failed: usize,
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +73,8 @@ pub struct SummaryReport {
     pub duration_ms: u128,
     pub totals: SummaryTotals,
     pub tests: Vec<SummaryTestRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +264,7 @@ async fn run_hook_steps(
         setup: Vec::new(),
         steps: steps.to_vec(),
         cleanup: Vec::new(),
+        status: None,
     };
     let result = run_test(
         &hook_spec,
@@ -438,7 +450,7 @@ fn encode_step_with_attachments(
     }))
 }
 
-pub fn write_allure_results(allure_dir: &Path, run_id: &str, results: &[TestRunResult]) -> Result<(), String> {
+pub fn write_allure_results(allure_dir: &Path, run_id: &str, results: &[TestRunResult], coverage: Option<&CoverageReport>) -> Result<(), String> {
     fs::create_dir_all(allure_dir).map_err(|e| format!("failed to create {}: {e}", allure_dir.display()))?;
     for (idx, test) in results.iter().enumerate() {
         let test_idx = idx + 1;
@@ -495,12 +507,23 @@ pub fn write_allure_results(allure_dir: &Path, run_id: &str, results: &[TestRunR
             .collect::<Result<Vec<_>, _>>()?;
 
         let test_uuid = format!("{}-{}", run_id, test_idx);
+        let allure_status = if test.status == "pending" { "skipped" } else { test.status.as_str() };
+        let allure_name = if test.status == "pending" {
+            format!("[ATDD: pending] {}", test.title)
+        } else {
+            test.title.clone()
+        };
         let payload = json!({
             "uuid": test_uuid,
             "historyId": format!("{}::{}", test.id, test.file),
-            "name": test.title,
-            "status": test.status,
+            "name": allure_name,
+            "status": allure_status,
             "stage": "finished",
+            "statusDetails": if test.status == "pending" {
+                json!({ "message": "[ATDD: pending] Test marked as pending — not yet implemented." })
+            } else {
+                json!({ "message": test.errors.first().unwrap_or(&String::new()) })
+            },
             "labels": build_suite_labels(&test.file),
             "steps": body_steps
         });
@@ -526,6 +549,15 @@ pub fn write_allure_results(allure_dir: &Path, run_id: &str, results: &[TestRunR
           "buildName": run_id
         }),
     )?;
+    // Write Allure environment.properties for API coverage.
+    if let Some(cov) = coverage {
+        let env_content = format!(
+            "api_coverage_total={}\napi_coverage_covered={}\napi_coverage_pct={:.1}\n",
+            cov.total_endpoints, cov.covered_endpoints, cov.percentage
+        );
+        fs::write(allure_dir.join("environment.properties"), env_content)
+            .map_err(|e| format!("failed to write environment.properties: {e}"))?;
+    }
     Ok(())
 }
 
@@ -567,6 +599,8 @@ pub fn build_run_options(
     tags_csv: Option<String>,
     report: Option<String>,
     summary_output: Option<String>,
+    coverage_enabled: bool,
+    openapi_path: Option<String>,
 ) -> Result<RunOptions, String> {
     let report_mode = resolve_report_mode(report)?;
     Ok(RunOptions {
@@ -577,12 +611,56 @@ pub fn build_run_options(
         tags: tags_csv.map(|x| parse_tags_csv(&x)).unwrap_or_default(),
         report_mode,
         summary_output,
+        coverage_enabled,
+        openapi_path,
     })
 }
+
+fn collect_pending_items(results: &[TestRunResult]) -> Vec<String> {
+    let mut items = Vec::new();
+    for r in results {
+        if r.status == "pending" {
+            items.push(format!("[{}] {}", r.file, r.title));
+        } else {
+            for step in &r.steps {
+                if step.status == "pending" {
+                    items.push(format!("[{}#step:{}] {}", r.file, step.name, step.name));
+                }
+            }
+        }
+    }
+    items
+}
+
+fn collect_executed_endpoints(results: &[TestRunResult]) -> HashSet<(String, String)> {
+    let mut set = HashSet::new();
+    for r in results {
+        // Pending tests do not contribute to coverage.
+        if r.status == "pending" {
+            continue;
+        }
+        for step in &r.steps {
+            if step.status == "pending" {
+                continue;
+            }
+            if let Some(req) = &step.request {
+                set.insert((req.method.clone(), req.url.clone()));
+            }
+        }
+    }
+    set
+}
+
 
 pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     let discovered = discover_speq_root(options.speq_root_override)?;
     let manifest = read_manifest(&discovered.root)?;
+
+    // Extract coverage settings before options fields are consumed.
+    let coverage_enabled = options.coverage_enabled;
+    let openapi_path_override = options.openapi_path.clone();
+    let summary_output_path = options.summary_output.clone();
+    let report_mode = options.report_mode.clone();
 
     let env_name = options
         .env_name
@@ -832,15 +910,59 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     }
 
     let passed = results.iter().filter(|x| x.status == "passed").count();
-    let failed = results.len() - passed;
+    let pending = results.iter().filter(|x| x.status == "pending").count();
+    let failed = results.iter().filter(|x| x.status == "failed").count();
+    let error_count = results.iter().filter(|x| x.status == "error").count();
     let duration_ms = run_started.elapsed().as_millis();
-    let status = if failed == 0 { "passed" } else { "failed" };
+    let status = if failed == 0 && error_count == 0 { "passed" } else { "failed" };
+
+    // Compute API coverage if enabled.
+    let coverage_report = {
+        let enabled = coverage_enabled
+            || manifest.coverage.as_ref().map(|c| c.enabled).unwrap_or(false);
+        if enabled {
+            let path = openapi_path_override.clone()
+                .or_else(|| manifest.coverage.as_ref().and_then(|c| c.openapi.clone()));
+            if let Some(oapi_path) = path {
+                match load_openapi_endpoints(&discovered.root, &oapi_path) {
+                    Ok(endpoints) => {
+                        let executed = collect_executed_endpoints(&results);
+                        Some(compute_coverage(&endpoints, &executed, &base_url))
+                    }
+                    Err(e) => {
+                        eprintln!("warning: {e}; skipping coverage report");
+                        None
+                    }
+                }
+            } else {
+                eprintln!("warning: coverage enabled but no openapi file specified; skipping coverage report");
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Check coverage fail_below threshold.
+    let mut coverage_exit_failure = false;
+    if let Some(ref report) = coverage_report {
+        let fail_below = manifest.coverage.as_ref().and_then(|c| c.fail_below);
+        if let Some(threshold) = fail_below {
+            if report.percentage < threshold {
+                eprintln!(
+                    "\nCoverage gate failed: {:.1}% < {:.0}% threshold",
+                    report.percentage, threshold
+                );
+                coverage_exit_failure = true;
+            }
+        }
+    }
 
     let reports_root = discovered
         .root
         .join(manifest.reports_dir_or_default());
-    let summary_output = options.summary_output.clone();
-    let summary_path = if let Some(raw_output) = summary_output {
+    let has_summary_output = summary_output_path.is_some();
+    let summary_path = if let Some(raw_output) = summary_output_path {
         let p = PathBuf::from(raw_output);
         if p.is_absolute() {
             p
@@ -864,44 +986,82 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
 
     let summary_struct = SummaryReport {
         status: status.to_string(),
-        started_at_ms: started_at_ms,
+        started_at_ms,
         duration_ms,
         totals: SummaryTotals {
             passed,
             failed,
             total: results.len(),
+            pending: if pending > 0 { Some(pending) } else { None },
+            error: if error_count > 0 { Some(error_count) } else { None },
         },
         tests: summary_tests,
+        coverage: coverage_report.clone(),
     };
     let summary_payload = serde_json::to_value(&summary_struct)
         .map_err(|e| format!("internal: failed to encode summary payload: {e}"))?;
 
-    if matches!(options.report_mode, ReportMode::Allure) && options.summary_output.is_some() {
+    if matches!(report_mode, ReportMode::Allure) && has_summary_output {
         return Err("`--output` is supported only with --report summary|all".to_string());
     }
 
-    let (summary_generated, allure_generated) = match options.report_mode {
+    let (summary_generated, allure_generated) = match report_mode {
         ReportMode::Summary => {
             write_json(&summary_path, &summary_payload)?;
             (true, false)
         }
         ReportMode::Allure => {
-            write_allure_results(&allure_dir, &run_id, &results)?;
+            write_allure_results(&allure_dir, &run_id, &results, coverage_report.as_ref())?;
             (false, true)
         }
         ReportMode::All => {
             write_json(&summary_path, &summary_payload)?;
-            write_allure_results(&allure_dir, &run_id, &results)?;
+            write_allure_results(&allure_dir, &run_id, &results, coverage_report.as_ref())?;
             (true, true)
         }
     };
 
+    // Print PENDING section if there are any pending tests or steps.
+    let pending_items = collect_pending_items(&results);
+    if !pending_items.is_empty() {
+        eprintln!("\nPENDING:");
+        for item in &pending_items {
+            eprintln!("  - {}", item);
+        }
+        eprintln!();
+    }
+
+    // Print API coverage console output.
+    if let Some(ref report) = coverage_report {
+        eprintln!(
+            "\nAPI Coverage: {}/{} endpoints ({:.1}%)",
+            report.covered_endpoints, report.total_endpoints, report.percentage
+        );
+        if !report.uncovered.is_empty() {
+            eprintln!("\nNot covered ({}):", report.uncovered.len());
+            for ep in &report.uncovered {
+                eprintln!("  ✗ {:<8} {}", ep.method, ep.path);
+            }
+        }
+        let covered_count = report.total_endpoints - report.uncovered.len();
+        if covered_count > 0 {
+            eprintln!("\nCovered ({}):", covered_count);
+        }
+        eprintln!();
+    }
+
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-          "ok": failed == 0,
+          "ok": failed == 0 && error_count == 0 && !coverage_exit_failure,
           "status": status,
-          "totals": { "passed": passed, "failed": failed, "total": results.len() },
+          "totals": {
+            "passed": passed,
+            "pending": pending,
+            "failed": failed,
+            "error": error_count,
+            "total": results.len()
+          },
           "reports": {
             "summary": if summary_generated { Some(summary_path.to_string_lossy().to_string()) } else { None::<String> },
             "allure": if allure_generated { Some(allure_dir.to_string_lossy().to_string()) } else { None::<String> }
@@ -910,6 +1070,6 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
         .map_err(|e| format!("internal: failed to encode json: {e}"))?
     );
 
-    Ok(if failed == 0 { 0 } else { 1 })
+    Ok(if failed == 0 && error_count == 0 && !coverage_exit_failure { 0 } else { 1 })
 }
 

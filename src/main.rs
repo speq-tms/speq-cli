@@ -12,7 +12,7 @@ fn usage() {
          Commands:\n\
           speq init [--mode in-repo|test-repo]\n\
           speq list [--speq-root <path>] [--format json]\n\
-          speq run [--speq-root <path>] [--env <name>] [--test <file>|--suite <dir>] [--tags a,b] [--report all|summary|allure] [--output <summary.json>]\n\
+          speq run [--speq-root <path>] [--env <name>] [--test <file>|--suite <dir>] [--tags a,b] [--report all|summary|allure] [--output <summary.json>] [--coverage] [--openapi <spec.yaml>]\n\
           speq report [--speq-root <path>] [--format all|summary|allure] [--summary <summary.json>]\n\
           speq doctor [--speq-root <path>] [--format json]\n\
           speq validate [--speq-root <path>] [--format json]\n\
@@ -72,6 +72,8 @@ async fn main() {
                 parse_flag_value(command_args, "--tags"),
                 parse_flag_value(command_args, "--report"),
                 parse_flag_value(command_args, "--output"),
+                has_flag(command_args, "--coverage"),
+                parse_flag_value(command_args, "--openapi"),
             );
             match options {
                 Ok(opts) => cli::run::command_run(opts).await,

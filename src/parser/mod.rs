@@ -43,6 +43,8 @@ pub struct TestSpec {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub cleanup: Vec<Step>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +76,8 @@ pub struct Step {
     pub assertions: Vec<Assertion>,
     #[serde(default)]
     pub condition: Option<ConditionConfig>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +178,12 @@ fn validate_assertion(assertion: &Assertion, file_path: &str, idx: usize) -> Res
 fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String> {
     if step.name.trim().is_empty() {
         return Err(format!("step name is required in {} step[{}]", file_path, idx));
+    }
+
+    if let Some(ref s) = step.status {
+        if s != "pending" {
+            return Err(format!("unsupported step status '{}' in {} step[{}] (only 'pending' is allowed)", s, file_path, idx));
+        }
     }
 
     match step.step_type.as_str() {
@@ -295,6 +305,11 @@ pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpe
     }
     if parsed.title.trim().is_empty() {
         return Err(format!("'title' is required in {}", file_path));
+    }
+    if let Some(ref s) = parsed.status {
+        if s != "pending" {
+            return Err(format!("unsupported test status '{}' in {} (only 'pending' is allowed)", s, file_path));
+        }
     }
     if parsed.steps.is_empty() && parsed.setup.is_empty() && parsed.cleanup.is_empty() {
         return Err(format!(
