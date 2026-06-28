@@ -1,3 +1,4 @@
+use crate::coverage::CoverageConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -58,6 +59,8 @@ pub struct Manifest {
     pub fixtures_dir: Option<String>,
     #[serde(default)]
     pub retry: Option<RetryConfig>,
+    #[serde(default)]
+    pub coverage: Option<CoverageConfig>,
 }
 
 impl Manifest {
