@@ -1,6 +1,6 @@
 [package]
 name = "speq-cli"
-version = "0.2.0-alpha.1"
+version = "1.0.0"
 edition = "2021"
 description = "Open-source CLI runtime for speq"
 license = "MIT"

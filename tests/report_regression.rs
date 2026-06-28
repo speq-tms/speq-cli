@@ -106,7 +106,7 @@ fn write_allure_results_writes_setup_and_teardown_to_container() {
         }],
     };
 
-    write_allure_results(&allure_dir, run_id, &[result]).expect("write allure results");
+    write_allure_results(&allure_dir, run_id, &[result], None).expect("write allure results");
 
     let container_raw = fs::read_to_string(allure_dir.join("1-container.json")).expect("read container");
     let container: Value = serde_json::from_str(&container_raw).expect("parse container");
@@ -164,7 +164,7 @@ fn write_allure_results_writes_request_response_and_assertions_attachments() {
         teardown_steps: Vec::new(),
     };
 
-    write_allure_results(&allure_dir, run_id, &[result]).expect("write allure results");
+    write_allure_results(&allure_dir, run_id, &[result], None).expect("write allure results");
 
     let test_raw = fs::read_to_string(allure_dir.join("1-result.json")).expect("read result");
     let test_json: Value = serde_json::from_str(&test_raw).expect("parse result");

@@ -12,12 +12,17 @@ fn usage() {
          Commands:\n\
           speq init [--mode in-repo|test-repo]\n\
           speq list [--speq-root <path>] [--format json]\n\
-          speq run [--speq-root <path>] [--env <name>] [--test <file>|--suite <dir>] [--tags a,b] [--report all|summary|allure] [--output <summary.json>]\n\
+          speq run [--speq-root <path>] [--env <name>] [--test <file>|--suite <dir>] [--tags a,b] [--report all|summary|allure] [--output <summary.json>] [--coverage] [--openapi <spec.yaml>]\n\
           speq report [--speq-root <path>] [--format all|summary|allure] [--summary <summary.json>]\n\
           speq doctor [--speq-root <path>] [--format json]\n\
-           speq validate [--speq-root <path>] [--format json]\n\
-           speq help\n"
+          speq validate [--speq-root <path>] [--format json]\n\
+          speq version\n\
+          speq help\n"
     );
+}
+
+fn version() {
+    println!("speq {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -67,6 +72,8 @@ async fn main() {
                 parse_flag_value(command_args, "--tags"),
                 parse_flag_value(command_args, "--report"),
                 parse_flag_value(command_args, "--output"),
+                has_flag(command_args, "--coverage"),
+                parse_flag_value(command_args, "--openapi"),
             );
             match options {
                 Ok(opts) => cli::run::command_run(opts).await,
@@ -92,6 +99,10 @@ async fn main() {
         }
         "help" | "-h" | "--help" => {
             usage();
+            Ok(EXIT_OK)
+        }
+        "version" | "-V" | "--version" => {
+            version();
             Ok(EXIT_OK)
         }
         other => Err(format!("unknown command: {other}")),

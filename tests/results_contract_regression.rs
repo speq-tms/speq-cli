@@ -21,6 +21,8 @@ fn summary_report_matches_results_v1_schema() {
             passed: 1,
             failed: 0,
             total: 1,
+            pending: None,
+            error: None,
         },
         tests: vec![SummaryTestRecord {
             id: "smoke.health".to_string(),
@@ -28,6 +30,7 @@ fn summary_report_matches_results_v1_schema() {
             duration_ms: 5,
             message: None,
         }],
+        coverage: None,
     };
     let instance = serde_json::to_value(summary).expect("summary to json");
 

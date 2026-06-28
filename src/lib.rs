@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod coverage;
 pub mod fixtures;
 pub mod generator;
 pub mod manifest;
