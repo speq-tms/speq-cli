@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The vendored contract copy must stay byte-identical to the published one.
+      - name: verify contracts are not vendored-and-forgotten
+        run: scripts/sync-contracts.sh --check
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --locked || cargo build
       - run: cargo test --locked || cargo test
