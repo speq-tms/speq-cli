@@ -802,6 +802,7 @@ async fn execute_api_step(
     client: &reqwest::Client,
     vars: &BTreeMap<String, Value>,
     base_url: &str,
+    env_headers: &BTreeMap<String, String>,
     step: &Step,
     runtime_paths: &RuntimePaths,
     cache: &mut RuntimeCaches,
@@ -834,10 +835,18 @@ async fn execute_api_step(
         format!("{}{}", base_url.trim_end_matches('/'), rendered_url)
     };
 
-    let mut rendered_headers = BTreeMap::new();
+    // Environment headers apply to every request; a step's own header of the
+    // same name replaces them. HTTP header names are case-insensitive, so a
+    // step header drops any case variant the environment contributed rather
+    // than letting both spellings reach the wire.
+    let mut rendered_headers: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in env_headers {
+        rendered_headers.insert(k.clone(), render_template(v, vars));
+    }
     for (k, v) in &step.headers {
-        let rendered = render_template(v, vars);
-        rendered_headers.insert(k.clone(), rendered);
+        let lower = k.to_ascii_lowercase();
+        rendered_headers.retain(|existing, _| existing.to_ascii_lowercase() != lower);
+        rendered_headers.insert(k.clone(), render_template(v, vars));
     }
 
     let effective_body: Option<Value> = if let Some(bff) = &step.body_from_fixture {
@@ -1127,6 +1136,7 @@ pub async fn run_test(
     test_file: &Path,
     rel_file: String,
     base_url: &str,
+    env_headers: &BTreeMap<String, String>,
     env_vars: &BTreeMap<String, Value>,
     runtime_paths: &RuntimePaths,
     retry_config: Option<&RetryConfig>,
@@ -1201,6 +1211,7 @@ pub async fn run_test(
         &client,
         &mut vars,
         base_url,
+        env_headers,
         &test.setup,
         test_file,
         &test.imports,
@@ -1215,6 +1226,7 @@ pub async fn run_test(
         &client,
         &mut vars,
         base_url,
+        env_headers,
         &test.steps,
         test_file,
         &test.imports,
@@ -1229,6 +1241,7 @@ pub async fn run_test(
         &client,
         &mut vars,
         base_url,
+        env_headers,
         &test.cleanup,
         test_file,
         &test.imports,
@@ -1291,6 +1304,7 @@ async fn run_step_group(
     client: &reqwest::Client,
     vars: &mut BTreeMap<String, Value>,
     base_url: &str,
+    env_headers: &BTreeMap<String, String>,
     steps: &[Step],
     test_file: &Path,
     imports: &[ImportSpec],
@@ -1405,7 +1419,7 @@ async fn run_step_group(
                                 continue;
                             }
                             let result =
-                                execute_api_step(client, &action_vars, base_url, action_step, runtime_paths, cache, retry_config)
+                                execute_api_step(client, &action_vars, base_url, env_headers, action_step, runtime_paths, cache, retry_config)
                                     .await;
                             if let (Some(step_id), Some(resp)) = (&action_step.id, &result.response) {
                                 id_responses.insert(step_id.clone(), resp.body.clone());
@@ -1472,7 +1486,7 @@ async fn run_step_group(
                     Ok(reusable_steps) => {
                         for reusable in reusable_steps {
                             let result =
-                                execute_api_step(client, vars, base_url, &reusable, runtime_paths, cache, retry_config).await;
+                                execute_api_step(client, vars, base_url, env_headers, &reusable, runtime_paths, cache, retry_config).await;
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
                             }
@@ -1513,7 +1527,7 @@ async fn run_step_group(
                 }
             }
         } else {
-            let result = execute_api_step(client, vars, base_url, step, runtime_paths, cache, retry_config).await;
+            let result = execute_api_step(client, vars, base_url, env_headers, step, runtime_paths, cache, retry_config).await;
             if result.status == "failed" {
                 errors.push(result.message.clone());
             }
@@ -1715,10 +1729,148 @@ actions:
             status: None,
         };
         let mut cache = RuntimeCaches::default();
-        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        let result = execute_api_step(&client, &vars, "", &BTreeMap::new(), &step, &runtime_paths, &mut cache, Some(&retry)).await;
         assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
         // 2 failures + 1 success = 3 total attempts
         assert_eq!(result.attempts_used, Some(3));
+    }
+
+    fn header_probe_step(name: &str, url: String, headers: BTreeMap<String, String>) -> crate::parser::Step {
+        crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: name.to_string(),
+            method: "GET".to_string(),
+            url,
+            headers,
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_headers_are_sent_and_rendered() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/env-headers")
+                    .header("x-source", "speq-examples")
+                    .header("authorization", "Bearer t0ken");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let root = make_tmp_dir("env-headers");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let mut vars = BTreeMap::new();
+        vars.insert("token".to_string(), Value::String("t0ken".to_string()));
+
+        let mut env_headers = BTreeMap::new();
+        env_headers.insert("x-source".to_string(), "speq-examples".to_string());
+        env_headers.insert("authorization".to_string(), "Bearer {{token}}".to_string());
+
+        let step = header_probe_step(
+            "env headers",
+            format!("{}/env-headers", server.base_url()),
+            BTreeMap::new(),
+        );
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(
+            &client,
+            &vars,
+            "",
+            &env_headers,
+            &step,
+            &runtime_paths,
+            &mut cache,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.status, "passed", "got: {}", result.message);
+        m.assert_async().await;
+
+        // The report must show what actually went on the wire.
+        let request = result.request.expect("request info recorded");
+        assert_eq!(request.headers.get("authorization").map(String::as_str), Some("Bearer t0ken"));
+        assert_eq!(request.headers.get("x-source").map(String::as_str), Some("speq-examples"));
+    }
+
+    #[tokio::test]
+    async fn step_header_overrides_environment_header_regardless_of_case() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/override")
+                    .header("x-source", "from-step");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let root = make_tmp_dir("env-headers-override");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let client = reqwest::Client::new();
+        let vars = BTreeMap::new();
+
+        let mut env_headers = BTreeMap::new();
+        env_headers.insert("x-source".to_string(), "from-env".to_string());
+
+        let mut step_headers = BTreeMap::new();
+        step_headers.insert("X-Source".to_string(), "from-step".to_string());
+
+        let step = header_probe_step(
+            "override",
+            format!("{}/override", server.base_url()),
+            step_headers,
+        );
+        let mut cache = RuntimeCaches::default();
+        let result = execute_api_step(
+            &client,
+            &vars,
+            "",
+            &env_headers,
+            &step,
+            &runtime_paths,
+            &mut cache,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.status, "passed", "got: {}", result.message);
+        m.assert_async().await;
+
+        // Exactly one spelling survives — the step's — so the server never sees
+        // both values of a case-insensitive header name.
+        let request = result.request.expect("request info recorded");
+        let source_headers: Vec<_> = request
+            .headers
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase() == "x-source")
+            .collect();
+        assert_eq!(source_headers.len(), 1, "got: {:?}", request.headers);
+        assert_eq!(source_headers[0].1, "from-step");
     }
 
     #[tokio::test]
@@ -1768,7 +1920,7 @@ actions:
             status: None,
         };
         let mut cache = RuntimeCaches::default();
-        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, Some(&retry)).await;
+        let result = execute_api_step(&client, &vars, "", &BTreeMap::new(), &step, &runtime_paths, &mut cache, Some(&retry)).await;
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("retry_exhausted"), "expected retry_exhausted, got: {}", result.message);
         assert_eq!(result.attempts_used, Some(3));
@@ -1819,7 +1971,7 @@ actions:
             status: None,
         };
         let mut cache = RuntimeCaches::default();
-        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        let result = execute_api_step(&client, &vars, "", &BTreeMap::new(), &step, &runtime_paths, &mut cache, None).await;
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("wait_timeout"), "expected wait_timeout, got: {}", result.message);
         assert!(result.wait_duration_ms.is_some());
@@ -1870,7 +2022,7 @@ actions:
             status: None,
         };
         let mut cache = RuntimeCaches::default();
-        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        let result = execute_api_step(&client, &vars, "", &BTreeMap::new(), &step, &runtime_paths, &mut cache, None).await;
         assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
         assert!(result.wait_duration_ms.is_some());
     }
@@ -1912,7 +2064,7 @@ actions:
             status: None,
         };
         let mut cache = RuntimeCaches::default();
-        let result = execute_api_step(&client, &vars, "", &step, &runtime_paths, &mut cache, None).await;
+        let result = execute_api_step(&client, &vars, "", &BTreeMap::new(), &step, &runtime_paths, &mut cache, None).await;
         assert_eq!(result.status, "passed", "expected passed, got: {}", result.message);
         assert_eq!(result.attempts_used, None);
         assert_eq!(result.wait_duration_ms, None);
@@ -2049,6 +2201,7 @@ actions:
             &client,
             &mut vars,
             "",
+            &BTreeMap::new(),
             &[use_step],
             std::path::Path::new("/tmp/test.yaml"),
             &imports,
@@ -2163,6 +2316,7 @@ actions:
             &client,
             &mut vars,
             "",
+            &BTreeMap::new(),
             &[create_step, get_step],
             std::path::Path::new("/tmp/test.yaml"),
             &imports,
@@ -2251,6 +2405,7 @@ actions:
             &client,
             &mut vars,
             "",
+            &BTreeMap::new(),
             &[use_step],
             std::path::Path::new("/tmp/test.yaml"),
             &imports,
@@ -2329,6 +2484,7 @@ actions:
             &client,
             &mut vars,
             "",
+            &BTreeMap::new(),
             &[use_step],
             std::path::Path::new("/tmp/test.yaml"),
             &imports,
