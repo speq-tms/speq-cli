@@ -13,6 +13,7 @@ pub struct Endpoint {
 
 /// Coverage config parsed from manifest.yaml `coverage:` block.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct CoverageConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -22,7 +23,9 @@ pub struct CoverageConfig {
     #[serde(default)]
     pub report: bool,
     /// Optional minimum coverage percentage; exit non-zero if below.
-    #[serde(default)]
+    /// Spelled `failBelow` like the rest of the manifest; `fail_below` is
+    /// still accepted, because that is what shipped in v1.0.0.
+    #[serde(default, alias = "fail_below")]
     pub fail_below: Option<f64>,
 }
 

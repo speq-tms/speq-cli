@@ -50,3 +50,46 @@ modulesDir: "shared/modules"
     assert_eq!(manifest.schemas_dir_or_default(), "contracts/schemas");
     assert_eq!(manifest.modules_dir_or_default(), "shared/modules");
 }
+
+#[test]
+fn coverage_threshold_reads_camel_case() {
+    let root = make_tmp_dir("manifest-fail-below-camel");
+    fs::write(
+        root.join("manifest.yaml"),
+        r#"
+version: "1"
+project: "demo"
+defaultEnvironment: "ci"
+coverage:
+  enabled: true
+  openapi: "openapi.yaml"
+  failBelow: 80
+"#,
+    )
+    .expect("write manifest");
+
+    let manifest = read_manifest(&root).expect("manifest should parse");
+    let coverage = manifest.coverage.expect("coverage block");
+    assert_eq!(coverage.fail_below, Some(80.0));
+}
+
+#[test]
+fn coverage_threshold_still_reads_the_snake_case_alias() {
+    let root = make_tmp_dir("manifest-fail-below-snake");
+    fs::write(
+        root.join("manifest.yaml"),
+        r#"
+version: "1"
+project: "demo"
+defaultEnvironment: "ci"
+coverage:
+  enabled: true
+  fail_below: 42.5
+"#,
+    )
+    .expect("write manifest");
+
+    let manifest = read_manifest(&root).expect("manifest should parse");
+    let coverage = manifest.coverage.expect("coverage block");
+    assert_eq!(coverage.fail_below, Some(42.5));
+}
