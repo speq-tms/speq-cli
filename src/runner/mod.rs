@@ -1573,7 +1573,6 @@ mod tests {
             assertion_type: "schema".to_string(),
             path: None,
             expected: None,
-            value: None,
             r#ref: Some("user.json".to_string()),
             inline: None,
         }];
@@ -1594,7 +1593,6 @@ mod tests {
             assertion_type: "schema".to_string(),
             path: None,
             expected: None,
-            value: None,
             r#ref: None,
             inline: Some(serde_json::json!({
                 "type": "object",
