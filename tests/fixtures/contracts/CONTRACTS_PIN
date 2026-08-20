@@ -1,0 +1,14 @@
+# The speq-contracts revision that tests/fixtures/contracts/ mirrors byte-for-byte.
+#
+# These files are NOT hand-editable. They are a vendored copy of the published
+# contracts, kept here only so `cargo test` can run offline. CI re-fetches this
+# revision and fails if the copy has drifted -- see scripts/sync-contracts.sh.
+#
+# To adopt a newer contract: change `ref` below, run `scripts/sync-contracts.sh`,
+# and commit the result together with whatever runtime change it describes.
+
+repo=speq-tms/speq-contracts
+ref=a2b967d64ad983e6b7326ba4069a0c7a0b8624a3
+
+# Schemas mirrored from that revision, as <path-under-schemas/>.
+schemas=results/v1.json
