@@ -135,3 +135,53 @@ steps:
         Some(42)
     );
 }
+
+#[test]
+fn assert_value_is_read_as_expected() {
+    let content = r#"
+id: "posts.assert.value"
+title: "assert written with value"
+steps:
+  - type: api
+    name: "GET post"
+    method: GET
+    url: "/posts/1"
+    assert:
+      - type: json
+        path: "$.id"
+        value: 999
+      - type: status
+        value: 200
+"#;
+
+    let parsed = parse_and_validate_test(content, "suites/posts/assert-value.yaml")
+        .expect("value should parse as expected");
+    let asserts = &parsed.steps[0].assertions;
+    assert_eq!(asserts[0].expected, Some(serde_json::json!(999)));
+    assert_eq!(asserts[1].expected, Some(serde_json::json!(200)));
+}
+
+#[test]
+fn assert_rejects_expected_and_value_together() {
+    let content = r#"
+id: "posts.assert.both"
+title: "assert written with both spellings"
+steps:
+  - type: api
+    name: "GET post"
+    method: GET
+    url: "/posts/1"
+    assert:
+      - type: json
+        path: "$.id"
+        expected: 1
+        value: 999
+"#;
+
+    let err = parse_and_validate_test(content, "suites/posts/assert-both.yaml")
+        .expect_err("expected and value in one assertion should fail");
+    assert!(
+        err.contains("expected"),
+        "error should name the field, got: {err}"
+    );
+}

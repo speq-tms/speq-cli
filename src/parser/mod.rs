@@ -93,10 +93,10 @@ pub struct Assertion {
     pub assertion_type: String,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
+    /// `value` is accepted as a spelling of `expected`, the way `markers`
+    /// aliases `tags`. Writing both in one assertion is a parse error.
+    #[serde(default, alias = "value")]
     pub expected: Option<Value>,
-    #[serde(default)]
-    pub value: Option<Value>,
     #[serde(default)]
     pub r#ref: Option<String>,
     #[serde(default)]
