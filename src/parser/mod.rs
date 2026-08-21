@@ -76,6 +76,10 @@ pub struct Step {
     pub assertions: Vec<Assertion>,
     #[serde(default)]
     pub condition: Option<ConditionConfig>,
+    /// Narrowest level of the request timeout: overrides the manifest and
+    /// environment `http.timeoutMs` for this step only.
+    #[serde(default, rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -184,6 +188,13 @@ pub(crate) fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<
         if s != "pending" {
             return Err(format!("unsupported step status '{}' in {} step[{}] (only 'pending' is allowed)", s, file_path, idx));
         }
+    }
+
+    if let Some(0) = step.timeout_ms {
+        return Err(format!(
+            "step timeoutMs must be > 0 in {} step[{}]",
+            file_path, idx
+        ));
     }
 
     match step.step_type.as_str() {
