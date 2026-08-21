@@ -175,7 +175,7 @@ fn validate_assertion(assertion: &Assertion, file_path: &str, idx: usize) -> Res
     Ok(())
 }
 
-fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String> {
+pub(crate) fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String> {
     if step.name.trim().is_empty() {
         return Err(format!("step name is required in {} step[{}]", file_path, idx));
     }

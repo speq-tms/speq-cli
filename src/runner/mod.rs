@@ -1,7 +1,7 @@
 use crate::fixtures::{load_fixture, materialize_fixture};
 use crate::generator::{resolve_gen_values, resolve_gen_variables};
 use crate::manifest::{BackoffStrategy, RetryConfig};
-use crate::parser::{parse_reusable_steps, Assertion, ConditionConfig, ImportSpec, Step, TestSpec};
+use crate::parser::{parse_reusable_steps, validate_step, Assertion, ConditionConfig, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
 use regex::Regex;
 use reqwest::Method;
@@ -442,24 +442,65 @@ fn resolve_returns_expression(
     })
 }
 
+/// Top-level keys a module file may carry. Anything else is dropped by
+/// `ModuleSpec`, so it has to be reported here or it is silently ignored.
+const MODULE_TOP_LEVEL_KEYS: [&str; 2] = ["actions", "variables"];
+
 pub fn validate_module_content(content: &str, file_path: &str) -> Vec<String> {
     let module: ModuleSpec = match serde_yaml::from_str(content) {
         Ok(m) => m,
         Err(e) => return vec![format!("invalid module YAML {}: {}", file_path, e)],
     };
     let mut errors = Vec::new();
+
+    // A wrapper key such as `module:` parses as a module with no actions, and every
+    // `use` of it then fails at run time with an unknown-action error. Say so here.
+    if let Ok(serde_yaml::Value::Mapping(top)) = serde_yaml::from_str::<serde_yaml::Value>(content) {
+        for key in top.keys() {
+            let Some(name) = key.as_str() else { continue };
+            if !MODULE_TOP_LEVEL_KEYS.contains(&name) {
+                errors.push(format!(
+                    "unknown top-level key '{}' in module {} (expected one of: {})",
+                    name,
+                    file_path,
+                    MODULE_TOP_LEVEL_KEYS.join(", ")
+                ));
+            }
+        }
+    }
+
     for (action_name, action_spec) in &module.actions {
+        // The same step is rejected outright inside a test spec; a module must not be
+        // the one place an unrunnable step survives validation.
+        let action_steps: &[Step] = match action_spec {
+            ModuleActionSpec::Legacy(steps) => steps,
+            ModuleActionSpec::Detailed(action) => &action.steps,
+        };
+        let action_label = format!("{} action '{}'", file_path, action_name);
+        for (idx, step) in action_steps.iter().enumerate() {
+            if let Err(e) = validate_step(step, &action_label, idx) {
+                errors.push(e);
+            }
+        }
+
         if let ModuleActionSpec::Detailed(action) = action_spec {
             if let Some(returns_map) = &action.returns {
                 let step_ids: std::collections::HashSet<&str> =
                     action.steps.iter().filter_map(|s| s.id.as_deref()).collect();
                 for (field, expr) in returns_map {
                     if let Some(rest) = expr.strip_prefix("$steps.") {
-                        if let Some((step_id, _)) = rest.split_once(".response.body.") {
+                        if let Some((step_id, body_path)) = rest.split_once(".response.body.") {
                             if !step_ids.contains(step_id) {
                                 errors.push(format!(
                                     "returns expression '{}' in action '{}' of {} references unknown step id '{}' (no step has id: {})",
                                     field, action_name, file_path, step_id, step_id
+                                ));
+                            }
+                            // '$steps.<id>.response.body.' resolves to nothing at run time.
+                            if body_path.trim().is_empty() {
+                                errors.push(format!(
+                                    "returns expression '{}' in action '{}' of {} has an empty body path (expected '$steps.<id>.response.body.<path>')",
+                                    field, action_name, file_path
                                 ));
                             }
                         } else {
@@ -1549,6 +1590,74 @@ mod tests {
         let path = std::env::temp_dir().join(format!("speq-cli-runner-{}-{}", name, suffix));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn module_action_steps_are_validated() {
+        // The same step is rejected outright inside a test spec.
+        let errors = validate_module_content(
+            "actions:\n  broken:\n    steps:\n      - type: api\n        name: n\n        method: GET\n",
+            "modules/broken.yaml",
+        );
+        assert_eq!(errors.len(), 1, "expected one error, got: {:?}", errors);
+        assert!(
+            errors[0].contains("step url is required") && errors[0].contains("action 'broken'"),
+            "expected a url error naming the action, got: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn module_action_steps_are_validated_in_the_legacy_shorthand() {
+        let errors = validate_module_content(
+            "actions:\n  broken:\n    - type: api\n      name: n\n      method: NOPE\n      url: /x\n",
+            "modules/broken.yaml",
+        );
+        assert_eq!(errors.len(), 1, "expected one error, got: {:?}", errors);
+        assert!(errors[0].contains("unsupported HTTP method"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn valid_module_still_passes() {
+        let errors = validate_module_content(
+            concat!(
+                "variables:\n  defaultLimit: 10\n",
+                "actions:\n  getPost:\n    properties:\n      - postId\n",
+                "    steps:\n      - type: api\n        id: s\n        name: n\n        method: GET\n        url: /posts/1\n",
+                "    returns:\n      postId: \"$steps.s.response.body.id\"\n",
+            ),
+            "modules/ok.yaml",
+        );
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn returns_expression_with_an_empty_body_path_is_rejected() {
+        let errors = validate_module_content(
+            concat!(
+                "actions:\n  a:\n",
+                "    steps:\n      - type: api\n        id: s\n        name: n\n        method: GET\n        url: /x\n",
+                "    returns:\n      out: \"$steps.s.response.body.\"\n",
+            ),
+            "modules/a.yaml",
+        );
+        assert_eq!(errors.len(), 1, "expected one error, got: {:?}", errors);
+        assert!(errors[0].contains("empty body path"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_reported_rather_than_ignored() {
+        // A `module:` wrapper parses as a module with no actions at all.
+        let errors = validate_module_content(
+            "module:\n  actions:\n    a:\n      steps: []\n",
+            "modules/wrapped.yaml",
+        );
+        assert_eq!(errors.len(), 1, "expected one error, got: {:?}", errors);
+        assert!(
+            errors[0].contains("unknown top-level key 'module'"),
+            "got: {}",
+            errors[0]
+        );
     }
 
     #[test]
