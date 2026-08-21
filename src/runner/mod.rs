@@ -126,6 +126,88 @@ struct ResolvedAction {
     returns: Option<HashMap<String, String>>,
 }
 
+/// Navigate a dotted path inside a JSON value. Object keys are matched by name,
+/// array elements by their numeric index.
+fn navigate_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        current = match current {
+            Value::Array(items) => part.parse::<usize>().ok().and_then(|i| items.get(i))?,
+            _ => current.get(part)?,
+        };
+    }
+    Some(current)
+}
+
+/// Resolve a template key against the variable map.
+///
+/// A flat key wins outright (`returns` bindings are stored as `<as>.<field>`).
+/// Otherwise the key is split on dot boundaries, longest prefix first, and the
+/// remainder is navigated inside the value found under that prefix — this is what
+/// makes `{{ <step id>.response.body.id }}` reach into a captured step response.
+fn lookup_var(vars: &BTreeMap<String, Value>, key: &str) -> Option<Value> {
+    if let Some(value) = vars.get(key) {
+        return Some(value.clone());
+    }
+    let mut split_at = key.rfind('.');
+    while let Some(i) = split_at {
+        let (prefix, rest) = (&key[..i], &key[i + 1..]);
+        if let Some(root) = vars.get(prefix) {
+            if let Some(found) = navigate_value(root, rest) {
+                return Some(found.clone());
+            }
+        }
+        split_at = prefix.rfind('.');
+    }
+    None
+}
+
+/// Every `{{ key }}` appearing in a string, in order, with the key trimmed.
+fn template_keys(input: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut start = 0usize;
+    while let Some(open_rel) = input[start..].find("{{") {
+        let open = start + open_rel;
+        let rest = &input[open + 2..];
+        let Some(close_rel) = rest.find("}}") else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        keys.push(input[open + 2..close].trim().to_string());
+        start = close + 2;
+    }
+    keys
+}
+
+/// The first `{{ … }}` left intact by `render_template`, verbatim, if any.
+fn find_unresolved_placeholder(input: &str) -> Option<String> {
+    let open = input.find("{{")?;
+    let close_rel = input[open + 2..].find("}}")?;
+    Some(input[open..open + 2 + close_rel + 2].to_string())
+}
+
+/// Bind a step's response so later steps can reach it as
+/// `<id>.response.status`, `<id>.response.body.<path>` and `<id>.response.headers.<name>`.
+fn bind_step_response(vars: &mut BTreeMap<String, Value>, step_id: &str, response: &HttpResponseInfo) {
+    let body = serde_json::from_str::<Value>(&response.body)
+        .unwrap_or_else(|_| Value::String(response.body.clone()));
+    let headers: serde_json::Map<String, Value> = response
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    vars.insert(
+        step_id.to_string(),
+        serde_json::json!({
+            "response": {
+                "status": response.status,
+                "body": body,
+                "headers": Value::Object(headers),
+            }
+        }),
+    );
+}
+
 fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
     let mut out = String::new();
     let mut start = 0usize;
@@ -136,9 +218,9 @@ fn render_template(input: &str, vars: &BTreeMap<String, Value>) -> String {
         if let Some(close_rel) = rest.find("}}") {
             let close = open + 2 + close_rel;
             let key = input[open + 2..close].trim();
-            if let Some(value) = vars.get(key) {
+            if let Some(value) = lookup_var(vars, key) {
                 let rendered = match value {
-                    Value::String(s) => s.clone(),
+                    Value::String(s) => s,
                     other => other.to_string(),
                 };
                 out.push_str(&rendered);
@@ -916,6 +998,38 @@ async fn execute_api_step(
         body: effective_body.clone(),
     };
 
+    // A placeholder that survived rendering is a mistake, not a literal: refuse to
+    // put it on the wire so it cannot turn into a mystery 404 further down.
+    let unresolved = find_unresolved_placeholder(&full_url)
+        .map(|p| (p, "url".to_string()))
+        .or_else(|| {
+            rendered_headers
+                .iter()
+                .find_map(|(k, v)| find_unresolved_placeholder(v).map(|p| (p, format!("header '{}'", k))))
+        })
+        .or_else(|| {
+            resolved_body
+                .as_ref()
+                .and_then(|b| find_unresolved_placeholder(&b.to_string()).map(|p| (p, "body".to_string())))
+        });
+    if let Some((placeholder, location)) = unresolved {
+        return StepRunResult {
+            name: step.name.clone(),
+            status: "failed".to_string(),
+            message: format!(
+                "unresolved_template: '{}' in {} is not bound to any variable",
+                placeholder, location
+            ),
+            response_status: None,
+            duration_ms: step_started.elapsed().as_millis(),
+            request: Some(request_info),
+            response: None,
+            assertions: Vec::new(),
+            attempts_used: None,
+            wait_duration_ms: None,
+        };
+    }
+
     let effective_retry = retry_config.filter(|c| c.enabled && c.max_attempts > 0);
     let max_attempts = effective_retry.map(|c| c.max_attempts).unwrap_or(1).max(1);
 
@@ -1271,17 +1385,19 @@ pub async fn run_test(
     }
 }
 
-fn step_references_pending(step: &Step, pending_step_names: &std::collections::HashSet<String>) -> bool {
-    if pending_step_names.is_empty() {
+/// True when the step reads a binding that a skipped step would have produced —
+/// a step `id` (`{{ <id>.response.… }}`) or a `use` step's `as` key
+/// (`{{ <as>.<field> }}`). Those are the only two names that ever bind a step
+/// result, so those are the only two the cascade can follow.
+fn step_references_pending(step: &Step, pending_bindings: &std::collections::HashSet<String>) -> bool {
+    if pending_bindings.is_empty() {
         return false;
     }
-    // Check all string fields that could contain {{ steps.<name>.response.* }} templates.
     let check_str = |s: &str| -> bool {
-        pending_step_names.iter().any(|name| {
-            let prefix = format!("steps.{}.", name);
-            s.contains(&format!("{{{{ {} ", prefix.trim_end_matches('.')))
-                || s.contains(&format!("{{{{{}", prefix))
-                || s.contains(&format!("{{{{ {}", prefix))
+        template_keys(s).iter().any(|key| {
+            pending_bindings
+                .iter()
+                .any(|binding| key == binding || key.starts_with(&format!("{}.", binding)))
         })
     };
     if check_str(&step.url) {
@@ -1314,13 +1430,15 @@ async fn run_step_group(
     errors: &mut Vec<String>,
     retry_config: Option<&RetryConfig>,
 ) {
-    let mut pending_step_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
     for step in steps {
         // ATDD: skip steps marked as pending or that depend on a pending step's output.
         let is_pending = step.status.as_deref() == Some("pending")
-            || step_references_pending(step, &pending_step_names);
+            || step_references_pending(step, &pending_bindings);
         if is_pending {
-            pending_step_names.insert(step.name.clone());
+            for binding in [step.id.as_ref(), step.r#as.as_ref()].into_iter().flatten() {
+                pending_bindings.insert(binding.clone());
+            }
             step_results.push(StepRunResult {
                 name: step.name.clone(),
                 status: "pending".to_string(),
@@ -1490,6 +1608,7 @@ async fn run_step_group(
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
                             }
+                            bind_result_if_identified(vars, &reusable, &result);
                             step_results.push(result);
                         }
                     }
@@ -1531,8 +1650,20 @@ async fn run_step_group(
             if result.status == "failed" {
                 errors.push(result.message.clone());
             }
+            bind_result_if_identified(vars, step, &result);
             step_results.push(result);
         }
+    }
+}
+
+/// Publish a passing step's response under its `id`. A failed step binds nothing,
+/// so a later step reading it fails loudly instead of quietly using a bad response.
+fn bind_result_if_identified(vars: &mut BTreeMap<String, Value>, step: &Step, result: &StepRunResult) {
+    if result.status != "passed" {
+        return;
+    }
+    if let (Some(step_id), Some(response)) = (&step.id, &result.response) {
+        bind_step_response(vars, step_id, response);
     }
 }
 
@@ -1549,6 +1680,294 @@ mod tests {
         let path = std::env::temp_dir().join(format!("speq-cli-runner-{}-{}", name, suffix));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn api_step(name: &str, method: &str, url: &str) -> Step {
+        Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: name.to_string(),
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+            status: None,
+        }
+    }
+
+    fn status_assert(expected: u16) -> Assertion {
+        Assertion {
+            assertion_type: "status".to_string(),
+            path: None,
+            expected: Some(serde_json::json!(expected)),
+            r#ref: None,
+            inline: None,
+        }
+    }
+
+    #[test]
+    fn lookup_var_prefers_an_exact_flat_key() {
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert("login.token".to_string(), serde_json::json!("flat"));
+        vars.insert(
+            "login".to_string(),
+            serde_json::json!({ "token": "nested" }),
+        );
+        assert_eq!(lookup_var(&vars, "login.token"), Some(serde_json::json!("flat")));
+    }
+
+    #[test]
+    fn lookup_var_navigates_into_a_bound_value() {
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert(
+            "created".to_string(),
+            serde_json::json!({
+                "response": { "status": 201, "body": { "id": 101, "tags": ["a", "b"] } }
+            }),
+        );
+        assert_eq!(
+            lookup_var(&vars, "created.response.body.id"),
+            Some(serde_json::json!(101))
+        );
+        assert_eq!(
+            lookup_var(&vars, "created.response.status"),
+            Some(serde_json::json!(201))
+        );
+        assert_eq!(
+            lookup_var(&vars, "created.response.body.tags.1"),
+            Some(serde_json::json!("b"))
+        );
+        assert_eq!(lookup_var(&vars, "created.response.body.missing"), None);
+    }
+
+    #[test]
+    fn render_template_resolves_a_step_response_path() {
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert(
+            "created".to_string(),
+            serde_json::json!({ "response": { "body": { "id": 101 } } }),
+        );
+        assert_eq!(
+            render_template("/posts/{{created.response.body.id}}", &vars),
+            "/posts/101"
+        );
+        assert_eq!(
+            render_template("/posts/{{ created.response.body.id }}", &vars),
+            "/posts/101"
+        );
+    }
+
+    #[test]
+    fn find_unresolved_placeholder_reports_the_first_one() {
+        assert_eq!(
+            find_unresolved_placeholder("/posts/{{created.response.body.id}}"),
+            Some("{{created.response.body.id}}".to_string())
+        );
+        assert_eq!(find_unresolved_placeholder("/posts/101"), None);
+        // An unterminated brace is not a placeholder.
+        assert_eq!(find_unresolved_placeholder("/posts/{{oops"), None);
+    }
+
+    #[test]
+    fn step_references_pending_follows_ids_and_as_keys() {
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        pending.insert("updated_post".to_string());
+        pending.insert("login".to_string());
+
+        let by_id = api_step("cleanup", "DELETE", "/posts/{{updated_post.response.body.id}}");
+        assert!(step_references_pending(&by_id, &pending));
+
+        let by_as = api_step("call", "GET", "/me?token={{ login.token }}");
+        assert!(step_references_pending(&by_as, &pending));
+
+        // The step *name* is not a binding, so it must not trigger the cascade.
+        let by_name = api_step("cleanup", "DELETE", "/posts/{{steps.PUT /posts/1.response.body.id}}");
+        assert!(!step_references_pending(&by_name, &pending));
+
+        let unrelated = api_step("other", "GET", "/posts/{{created.response.body.id}}");
+        assert!(!step_references_pending(&unrelated, &pending));
+    }
+
+    #[tokio::test]
+    async fn step_id_binds_response_for_a_later_step_in_the_same_test() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/posts");
+                then.status(201).body(r#"{"id":101,"title":"t"}"#);
+            })
+            .await;
+        let read_back = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/posts/101");
+                then.status(200).body(r#"{"id":101,"title":"t"}"#);
+            })
+            .await;
+
+        let root = make_tmp_dir("step-chaining");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+
+        let mut create = api_step("create", "POST", "/posts");
+        create.id = Some("created".to_string());
+        create.body = Some(serde_json::json!({ "title": "t" }));
+        create.assertions = vec![status_assert(201)];
+
+        let mut read = api_step("read it back", "GET", "/posts/{{created.response.body.id}}");
+        read.assertions = vec![status_assert(200)];
+
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            &server.base_url(),
+            &BTreeMap::new(),
+            &[create, read],
+            std::path::Path::new("/tmp/test.yaml"),
+            &[],
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert_eq!(step_results.len(), 2);
+        assert!(step_results.iter().all(|r| r.status == "passed"));
+        read_back.assert_async().await;
+        assert_eq!(
+            lookup_var(&vars, "created.response.status"),
+            Some(serde_json::json!(201))
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_placeholder_fails_the_step_instead_of_being_sent() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let never_called = server
+            .mock_async(|when, then| {
+                when.method(GET);
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let root = make_tmp_dir("unresolved-template");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+
+        let step = api_step("read", "GET", "/posts/{{nobody.response.body.id}}");
+
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            &server.base_url(),
+            &BTreeMap::new(),
+            &[step],
+            std::path::Path::new("/tmp/test.yaml"),
+            &[],
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert_eq!(step_results.len(), 1);
+        assert_eq!(step_results[0].status, "failed");
+        assert!(
+            step_results[0].message.contains("unresolved_template"),
+            "expected unresolved_template, got: {}",
+            step_results[0].message
+        );
+        never_called.assert_hits_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn pending_step_cascades_to_the_step_reading_its_id() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        let never_called = server
+            .mock_async(|when, then| {
+                when.method(DELETE);
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let root = make_tmp_dir("pending-cascade");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+
+        let mut pending = api_step("update", "PUT", "/posts/1");
+        pending.id = Some("updated".to_string());
+        pending.status = Some("pending".to_string());
+
+        let cleanup = api_step("cleanup", "DELETE", "/posts/{{updated.response.body.id}}");
+
+        let client = reqwest::Client::new();
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        let mut step_results = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut cache = RuntimeCaches::default();
+
+        run_step_group(
+            &client,
+            &mut vars,
+            &server.base_url(),
+            &BTreeMap::new(),
+            &[pending, cleanup],
+            std::path::Path::new("/tmp/test.yaml"),
+            &[],
+            &runtime_paths,
+            &mut cache,
+            &mut step_results,
+            &mut errors,
+            None,
+        )
+        .await;
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert_eq!(step_results.len(), 2);
+        assert!(
+            step_results.iter().all(|r| r.status == "pending"),
+            "expected both steps pending, got: {:?}",
+            step_results.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
+        never_called.assert_hits_async(0).await;
     }
 
     #[test]
