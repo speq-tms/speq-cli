@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -31,25 +32,46 @@ pub fn discover_speq_root(override_path: Option<String>) -> Result<SpeqRoot, Str
         });
     }
 
-    let in_repo = is_in_repo_mode(&cwd);
-    let test_repo = is_test_repo_mode(&cwd);
+    // Walk from the current directory towards the filesystem root and take the
+    // first directory that looks like a project, the way git, cargo and npm
+    // resolve theirs. The nearest root wins; a candidate further up is never
+    // considered once a nearer one matches.
+    for dir in cwd.ancestors() {
+        let in_repo = is_in_repo_mode(dir);
+        let test_repo = is_test_repo_mode(dir);
 
-    if in_repo && test_repo {
-        return Err(
-            "ambiguous speq layout: both .speq and repository root look valid, pass --speq-root".to_string(),
-        );
+        // Two layouts in one directory is still a refusal to guess. Name the
+        // directory, because with the walk it need not be the one you are in.
+        if in_repo && test_repo {
+            return Err(format!(
+                "ambiguous speq layout in {}: both .speq and repository root look valid, pass --speq-root",
+                dir.display()
+            ));
+        }
+        if in_repo {
+            return Ok(SpeqRoot {
+                mode: "in-repo".to_string(),
+                root: dir.join(".speq"),
+            });
+        }
+        if test_repo {
+            // Standing inside an in-repo project's own .speq directory reaches
+            // the same root from below. Reporting that as test-repo would
+            // misdescribe the layout to `doctor` and `validate`.
+            let mode = if dir.file_name() == Some(OsStr::new(".speq")) {
+                "in-repo"
+            } else {
+                "test-repo"
+            };
+            return Ok(SpeqRoot {
+                mode: mode.to_string(),
+                root: dir.to_path_buf(),
+            });
+        }
     }
-    if in_repo {
-        return Ok(SpeqRoot {
-            mode: "in-repo".to_string(),
-            root: cwd.join(".speq"),
-        });
-    }
-    if test_repo {
-        return Ok(SpeqRoot {
-            mode: "test-repo".to_string(),
-            root: cwd,
-        });
-    }
-    Err("speq root not found; run 'speq init' or pass --speq-root".to_string())
+
+    Err(format!(
+        "speq root not found in {} or any parent directory; run 'speq init' or pass --speq-root",
+        cwd.display()
+    ))
 }

@@ -93,10 +93,10 @@ pub struct Assertion {
     pub assertion_type: String,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
+    /// `value` is accepted as a spelling of `expected`, the way `markers`
+    /// aliases `tags`. Writing both in one assertion is a parse error.
+    #[serde(default, alias = "value")]
     pub expected: Option<Value>,
-    #[serde(default)]
-    pub value: Option<Value>,
     #[serde(default)]
     pub r#ref: Option<String>,
     #[serde(default)]
@@ -175,7 +175,7 @@ fn validate_assertion(assertion: &Assertion, file_path: &str, idx: usize) -> Res
     Ok(())
 }
 
-fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String> {
+pub(crate) fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<(), String> {
     if step.name.trim().is_empty() {
         return Err(format!("step name is required in {} step[{}]", file_path, idx));
     }

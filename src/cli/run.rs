@@ -39,8 +39,19 @@ pub struct RunOptions {
 struct EnvYaml {
     #[serde(default, rename = "baseUrl")]
     base_url: Option<String>,
+    /// Headers sent on every request of the run; a step's own header of the
+    /// same name wins.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// Everything the selected environment file contributes to a run.
+struct EnvConfig {
+    base_url: String,
+    headers: BTreeMap<String, String>,
+    vars: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,11 +143,11 @@ pub fn resolve_report_mode(raw: Option<String>) -> Result<ReportMode, String> {
     }
 }
 
-fn read_env_vars(
+fn read_env_config(
     speq_root: &Path,
     manifest: &Manifest,
     env_name: &str,
-) -> Result<(String, BTreeMap<String, serde_json::Value>), String> {
+) -> Result<EnvConfig, String> {
     let env_path = speq_root
         .join(manifest.environments_dir_or_default())
         .join(format!("{}.yaml", env_name));
@@ -152,7 +163,11 @@ fn read_env_vars(
         vars.insert(k, json_value);
     }
     vars.insert("baseUrl".to_string(), serde_json::Value::String(base_url.clone()));
-    Ok((base_url, vars))
+    Ok(EnvConfig {
+        base_url,
+        headers: parsed.headers,
+        vars,
+    })
 }
 
 fn suite_key_for_test(suites_root: &Path, test_file: &Path) -> String {
@@ -246,6 +261,7 @@ async fn run_hook_steps(
     test_file: &Path,
     suite_key: &str,
     base_url: &str,
+    env_headers: &BTreeMap<String, String>,
     vars: &BTreeMap<String, serde_json::Value>,
     runtime_paths: &RuntimePaths,
     imports: &[ImportSpec],
@@ -271,6 +287,7 @@ async fn run_hook_steps(
         test_file,
         format!("{}#{}", suite_key, hook_name),
         base_url,
+        env_headers,
         vars,
         runtime_paths,
         retry_config,
@@ -665,7 +682,11 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
     let env_name = options
         .env_name
         .unwrap_or_else(|| manifest.default_environment.clone());
-    let (base_url, env_vars) = read_env_vars(&discovered.root, &manifest, &env_name)?;
+    let EnvConfig {
+        base_url,
+        headers: env_headers,
+        vars: env_vars,
+    } = read_env_config(&discovered.root, &manifest, &env_name)?;
     if base_url.trim().is_empty() {
         return Err("baseUrl is required in selected environment file".to_string());
     }
@@ -719,6 +740,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &file,
                 &suite_ctx.suite_key,
                 &base_url,
+                &env_headers,
                 &effective_vars,
                 &runtime_paths,
                 &suite_ctx.suite_imports,
@@ -760,6 +782,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &file,
             &suite_ctx.suite_key,
             &base_url,
+            &env_headers,
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
@@ -792,6 +815,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                     &file,
                     rel,
                     &base_url,
+                    &env_headers,
                     &effective_vars,
                     &runtime_paths,
                     retry_cfg,
@@ -806,6 +830,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &file,
                 rel,
                 &base_url,
+                &env_headers,
                 &effective_vars,
                 &runtime_paths,
                 retry_cfg,
@@ -832,6 +857,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &file,
             &suite_ctx.suite_key,
             &base_url,
+            &env_headers,
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
@@ -882,6 +908,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &test_path,
             &suite_ctx.suite_key,
             &base_url,
+            &env_headers,
             &effective_vars,
             &runtime_paths,
             &suite_ctx.suite_imports,
