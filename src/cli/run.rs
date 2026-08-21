@@ -1,11 +1,11 @@
 use crate::cli::discovery::discover_speq_root;
 use crate::cli::files::{collect_suite_init_files, collect_yaml_files, relative_unix};
 use crate::coverage::{compute_coverage, load_openapi_endpoints, CoverageReport};
-use crate::manifest::{read_manifest, Manifest};
+use crate::manifest::{read_manifest, HttpConfig, Manifest};
 use crate::parser::{
     parse_and_validate_suite_init, parse_and_validate_test, ImportSpec, Step, SuiteInitSpec, TestSpec,
 };
-use crate::runner::{run_test, RuntimePaths, StepRunResult, TestRunResult};
+use crate::runner::{build_http_runtime, run_test, HttpRuntime, RuntimePaths, StepRunResult, TestRunResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +43,9 @@ struct EnvYaml {
     /// same name wins.
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Transport policy narrowing the manifest's `http` block.
+    #[serde(default)]
+    http: Option<HttpConfig>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_yaml::Value>,
 }
@@ -52,6 +55,7 @@ struct EnvConfig {
     base_url: String,
     headers: BTreeMap<String, String>,
     vars: BTreeMap<String, serde_json::Value>,
+    http: Option<HttpConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,10 +167,14 @@ fn read_env_config(
         vars.insert(k, json_value);
     }
     vars.insert("baseUrl".to_string(), serde_json::Value::String(base_url.clone()));
+    if let Some(http) = &parsed.http {
+        http.validate(&env_path.display().to_string())?;
+    }
     Ok(EnvConfig {
         base_url,
         headers: parsed.headers,
         vars,
+        http: parsed.http,
     })
 }
 
@@ -266,6 +274,7 @@ async fn run_hook_steps(
     runtime_paths: &RuntimePaths,
     imports: &[ImportSpec],
     retry_config: Option<&crate::manifest::RetryConfig>,
+    http: &HttpRuntime,
 ) -> Option<HookExecutionResult> {
     if steps.is_empty() {
         return None;
@@ -291,6 +300,7 @@ async fn run_hook_steps(
         vars,
         runtime_paths,
         retry_config,
+        http,
     )
     .await;
     let prefixed_steps = result
@@ -686,10 +696,18 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
         base_url,
         headers: env_headers,
         vars: env_vars,
+        http: env_http,
     } = read_env_config(&discovered.root, &manifest, &env_name)?;
     if base_url.trim().is_empty() {
         return Err("baseUrl is required in selected environment file".to_string());
     }
+
+    let effective_http = manifest
+        .http
+        .clone()
+        .unwrap_or_default()
+        .merged_with(env_http.as_ref());
+    let http_runtime = build_http_runtime(&effective_http, &discovered.root)?;
 
     let suites_root = discovered.root.join(manifest.suites_dir_or_default());
     let runtime_paths = RuntimePaths {
@@ -745,6 +763,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &runtime_paths,
                 &suite_ctx.suite_imports,
                 retry_cfg,
+                &http_runtime,
             )
             .await
             {
@@ -787,6 +806,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &runtime_paths,
             &suite_ctx.suite_imports,
             retry_cfg,
+            &http_runtime,
         )
         .await;
 
@@ -819,6 +839,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                     &effective_vars,
                     &runtime_paths,
                     retry_cfg,
+                    &http_runtime,
                 )
                 .await
             }
@@ -834,6 +855,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
                 &effective_vars,
                 &runtime_paths,
                 retry_cfg,
+                &http_runtime,
             )
             .await
         };
@@ -862,6 +884,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &runtime_paths,
             &suite_ctx.suite_imports,
             retry_cfg,
+            &http_runtime,
         )
         .await
         {
@@ -913,6 +936,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             &runtime_paths,
             &suite_ctx.suite_imports,
             manifest.retry.as_ref(),
+            &http_runtime,
         )
         .await
         {

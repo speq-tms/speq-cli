@@ -1,7 +1,7 @@
 use crate::cli::discovery::discover_speq_root;
 use crate::cli::files::{collect_suite_init_files, collect_yaml_files};
 use crate::fixtures::load_fixture;
-use crate::manifest::read_manifest;
+use crate::manifest::{read_manifest, worst_case_step_budget_ms, HttpConfig};
 use crate::parser::{parse_and_validate_suite_init, parse_and_validate_test};
 use crate::runner::validate_module_content;
 use serde_json::json;
@@ -61,6 +61,39 @@ fn validate_fixture_refs(
     errors
 }
 
+/// Only the transport policy is read here; the rest of an environment file is
+/// free-form variables that `validate` has nothing to say about.
+#[derive(Debug, serde::Deserialize)]
+struct EnvHttpProbe {
+    #[serde(default)]
+    http: Option<HttpConfig>,
+}
+
+/// A malformed `http` block in an environment file otherwise surfaces only on
+/// the first request of a run against that environment.
+fn validate_environment_files(environments_root: &Path) -> Vec<String> {
+    let mut errors = Vec::new();
+    if !environments_root.is_dir() {
+        return errors;
+    }
+    for file in collect_yaml_files(environments_root) {
+        match fs::read_to_string(&file) {
+            Ok(content) => match serde_yaml::from_str::<EnvHttpProbe>(&content) {
+                Ok(probe) => {
+                    if let Some(http) = probe.http {
+                        if let Err(e) = http.validate(&file.display().to_string()) {
+                            errors.push(e);
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("invalid env yaml {}: {e}", file.display())),
+            },
+            Err(e) => errors.push(format!("failed to read env file {}: {e}", file.display())),
+        }
+    }
+    errors
+}
+
 pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -> Result<(), String> {
     let discovered = discover_speq_root(speq_root_override)?;
     let manifest = read_manifest(&discovered.root)?;
@@ -110,6 +143,14 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
     }
 
     errors.extend(validate_module_files(&modules_root));
+    errors.extend(validate_environment_files(
+        &discovered.root.join(manifest.environments_dir_or_default()),
+    ));
+
+    // Retry multiplies the request budget; report the product so a run's real
+    // patience is never a surprise.
+    let worst_case_step_budget_ms =
+        worst_case_step_budget_ms(manifest.http.as_ref(), manifest.retry.as_ref());
 
     if format_json {
         let payload = json!({
@@ -119,6 +160,7 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
             "manifestVersion": manifest.version,
             "testsCount": files.len(),
             "suiteInitCount": init_files.len(),
+            "worstCaseStepBudgetMs": worst_case_step_budget_ms,
             "errors": errors
         });
         println!(
@@ -131,6 +173,10 @@ pub fn command_validate(speq_root_override: Option<String>, format_json: bool) -
             discovered.mode,
             discovered.root.display(),
             files.len()
+        );
+        println!(
+            "Worst-case budget for one step (timeout x retry attempts + backoff): {}ms",
+            worst_case_step_budget_ms
         );
     } else {
         println!("Validation failed:");

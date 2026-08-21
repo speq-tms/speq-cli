@@ -1,6 +1,6 @@
 use crate::fixtures::{load_fixture, materialize_fixture};
 use crate::generator::{resolve_gen_values, resolve_gen_variables};
-use crate::manifest::{BackoffStrategy, RetryConfig};
+use crate::manifest::{BackoffStrategy, HttpConfig, RetryConfig, DEFAULT_REDIRECT_HOPS};
 use crate::parser::{parse_reusable_steps, validate_step, Assertion, ConditionConfig, ImportSpec, Step, TestSpec};
 use jsonschema::JSONSchema;
 use regex::Regex;
@@ -12,6 +12,111 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// A built client plus the budget it was built with. The budget travels with
+/// the client because a timeout failure has to name the budget it blew, and a
+/// step that narrows `timeoutMs` names its own instead.
+#[derive(Debug, Clone)]
+pub struct HttpRuntime {
+    pub client: reqwest::Client,
+    pub timeout_ms: u64,
+}
+
+impl HttpRuntime {
+    /// Budget in force for `step` — its own `timeoutMs` if it narrows one,
+    /// otherwise the client's.
+    pub fn budget_for(&self, step: &Step) -> u64 {
+        step.timeout_ms.unwrap_or(self.timeout_ms)
+    }
+}
+
+/// Builds the one client the run uses, applying the merged transport policy.
+///
+/// Relative TLS paths resolve against `speq_root` so that a manifest stays
+/// portable between checkouts.
+pub fn build_http_runtime(cfg: &HttpConfig, speq_root: &Path) -> Result<HttpRuntime, String> {
+    let timeout_ms = cfg.timeout_ms_or_default();
+    let connect_timeout_ms = cfg.connect_timeout_ms_or_default();
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .connect_timeout(Duration::from_millis(connect_timeout_ms));
+
+    let hops = cfg
+        .follow_redirects
+        .as_ref()
+        .map(|f| f.max_hops())
+        .unwrap_or(DEFAULT_REDIRECT_HOPS);
+    builder = builder.redirect(if hops == 0 {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::limited(hops as usize)
+    });
+
+    if let Some(proxy) = cfg.proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let p = reqwest::Proxy::all(proxy)
+            .map_err(|e| format!("http.proxy '{proxy}' is not usable: {e}"))?;
+        builder = builder.proxy(p);
+    }
+
+    let resolve = |raw: &str| -> PathBuf {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            p
+        } else {
+            speq_root.join(p)
+        }
+    };
+
+    if let Some(ca_file) = cfg.ca_file.as_deref() {
+        let path = resolve(ca_file);
+        let pem = fs::read(&path)
+            .map_err(|e| format!("failed to read http.caFile {}: {e}", path.display()))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| format!("invalid PEM in http.caFile {}: {e}", path.display()))?;
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if let (Some(cert_file), Some(key_file)) = (cfg.client_cert.as_deref(), cfg.client_key.as_deref()) {
+        let cert_path = resolve(cert_file);
+        let key_path = resolve(key_file);
+        let mut pem = fs::read(&cert_path)
+            .map_err(|e| format!("failed to read http.clientCert {}: {e}", cert_path.display()))?;
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(
+            &fs::read(&key_path)
+                .map_err(|e| format!("failed to read http.clientKey {}: {e}", key_path.display()))?,
+        );
+        // rustls takes certificate and key as one concatenated PEM buffer.
+        let identity = reqwest::Identity::from_pem(&pem).map_err(|e| {
+            format!(
+                "invalid client identity from {} + {}: {e}",
+                cert_path.display(),
+                key_path.display()
+            )
+        })?;
+        builder = builder.identity(identity);
+    }
+
+    if cfg.insecure_skip_verify.unwrap_or(false) {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    Ok(HttpRuntime { client, timeout_ms })
+}
+
+/// reqwest reports connect, read, and total-budget expiry all as timeouts;
+/// `is_timeout` already walks the source chain.
+fn is_timeout_error(e: &reqwest::Error) -> bool {
+    e.is_timeout()
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -922,7 +1027,7 @@ fn run_assertions(
 }
 
 async fn execute_api_step(
-    client: &reqwest::Client,
+    http: &HttpRuntime,
     vars: &BTreeMap<String, Value>,
     base_url: &str,
     env_headers: &BTreeMap<String, String>,
@@ -1091,7 +1196,11 @@ async fn execute_api_step(
             retry_attempt += 1;
             total_attempts += 1;
 
-            let mut req = client.request(method.clone(), full_url.clone());
+            let mut req = http.client.request(method.clone(), full_url.clone());
+            if let Some(step_timeout) = step.timeout_ms {
+                // Narrowest level wins: a step budget replaces the client's.
+                req = req.timeout(Duration::from_millis(step_timeout));
+            }
             for (k, v) in &rendered_headers {
                 req = req.header(k, v);
             }
@@ -1139,7 +1248,17 @@ async fn execute_api_step(
                         continue 'retry;
                     }
 
-                    let msg = if should_retry_network {
+                    let msg = if is_timeout_error(&e) {
+                        let budget = http.budget_for(step);
+                        if should_retry_network {
+                            format!(
+                                "timeout: request exceeded {}ms budget after {} attempt(s)",
+                                budget, retry_attempt
+                            )
+                        } else {
+                            format!("timeout: request exceeded {}ms budget", budget)
+                        }
+                    } else if should_retry_network {
                         format!("retry_exhausted: request failed after {} attempt(s): {}", retry_attempt, e)
                     } else {
                         format!("request failed: {}", e)
@@ -1295,6 +1414,7 @@ pub async fn run_test(
     env_vars: &BTreeMap<String, Value>,
     runtime_paths: &RuntimePaths,
     retry_config: Option<&RetryConfig>,
+    http: &HttpRuntime,
 ) -> TestRunResult {
     let started = Instant::now();
 
@@ -1314,7 +1434,6 @@ pub async fn run_test(
         };
     }
 
-    let client = reqwest::Client::new();
     let mut cache = RuntimeCaches::default();
     let mut vars = env_vars.clone();
     let imported_vars = match collect_import_variables(&test.imports, runtime_paths, &mut cache.module_cache) {
@@ -1363,7 +1482,7 @@ pub async fn run_test(
     let mut errors = Vec::new();
 
     run_step_group(
-        &client,
+        http,
         &mut vars,
         base_url,
         env_headers,
@@ -1378,7 +1497,7 @@ pub async fn run_test(
     )
     .await;
     run_step_group(
-        &client,
+        http,
         &mut vars,
         base_url,
         env_headers,
@@ -1393,7 +1512,7 @@ pub async fn run_test(
     )
     .await;
     run_step_group(
-        &client,
+        http,
         &mut vars,
         base_url,
         env_headers,
@@ -1458,7 +1577,7 @@ fn step_references_pending(step: &Step, pending_bindings: &std::collections::Has
 }
 
 async fn run_step_group(
-    client: &reqwest::Client,
+    http: &HttpRuntime,
     vars: &mut BTreeMap<String, Value>,
     base_url: &str,
     env_headers: &BTreeMap<String, String>,
@@ -1578,7 +1697,7 @@ async fn run_step_group(
                                 continue;
                             }
                             let result =
-                                execute_api_step(client, &action_vars, base_url, env_headers, action_step, runtime_paths, cache, retry_config)
+                                execute_api_step(http, &action_vars, base_url, env_headers, action_step, runtime_paths, cache, retry_config)
                                     .await;
                             if let (Some(step_id), Some(resp)) = (&action_step.id, &result.response) {
                                 id_responses.insert(step_id.clone(), resp.body.clone());
@@ -1645,7 +1764,7 @@ async fn run_step_group(
                     Ok(reusable_steps) => {
                         for reusable in reusable_steps {
                             let result =
-                                execute_api_step(client, vars, base_url, env_headers, &reusable, runtime_paths, cache, retry_config).await;
+                                execute_api_step(http, vars, base_url, env_headers, &reusable, runtime_paths, cache, retry_config).await;
                             if result.status == "failed" {
                                 errors.push(result.message.clone());
                             }
@@ -1687,7 +1806,7 @@ async fn run_step_group(
                 }
             }
         } else {
-            let result = execute_api_step(client, vars, base_url, env_headers, step, runtime_paths, cache, retry_config).await;
+            let result = execute_api_step(http, vars, base_url, env_headers, step, runtime_paths, cache, retry_config).await;
             if result.status == "failed" {
                 errors.push(result.message.clone());
             }
@@ -1712,6 +1831,11 @@ fn bind_result_if_identified(vars: &mut BTreeMap<String, Value>, step: &Step, re
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Client with the shipped defaults, as a run would build it.
+    fn test_http_runtime() -> HttpRuntime {
+        build_http_runtime(&HttpConfig::default(), Path::new(".")).expect("default client builds")
+    }
 
     fn make_tmp_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -1739,6 +1863,7 @@ mod tests {
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         }
     }
@@ -1869,7 +1994,7 @@ mod tests {
         let mut read = api_step("read it back", "GET", "/posts/{{created.response.body.id}}");
         read.assertions = vec![status_assert(200)];
 
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let mut step_results = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -1922,7 +2047,7 @@ mod tests {
 
         let step = api_step("read", "GET", "/posts/{{nobody.response.body.id}}");
 
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let mut step_results = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -1979,7 +2104,7 @@ mod tests {
 
         let cleanup = api_step("cleanup", "DELETE", "/posts/{{updated.response.body.id}}");
 
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let mut step_results = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -2178,6 +2303,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
         let mut cache = HashMap::new();
@@ -2225,7 +2351,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
         let retry = crate::manifest::RetryConfig {
             enabled: true,
@@ -2252,6 +2378,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
         let mut cache = RuntimeCaches::default();
@@ -2277,6 +2404,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         }
     }
@@ -2302,7 +2430,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars = BTreeMap::new();
         vars.insert("token".to_string(), Value::String("t0ken".to_string()));
 
@@ -2357,7 +2485,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
 
         let mut env_headers = BTreeMap::new();
@@ -2416,7 +2544,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
         let retry = crate::manifest::RetryConfig {
             enabled: true,
@@ -2443,6 +2571,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
         let mut cache = RuntimeCaches::default();
@@ -2469,7 +2598,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
         let step = crate::parser::Step {
             step_type: "api".to_string(),
@@ -2494,6 +2623,7 @@ actions:
                     interval_ms: 50,
                 }),
             }),
+            timeout_ms: None,
             status: None,
         };
         let mut cache = RuntimeCaches::default();
@@ -2520,7 +2650,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
         let step = crate::parser::Step {
             step_type: "api".to_string(),
@@ -2545,6 +2675,7 @@ actions:
                     interval_ms: 100,
                 }),
             }),
+            timeout_ms: None,
             status: None,
         };
         let mut cache = RuntimeCaches::default();
@@ -2570,7 +2701,7 @@ actions:
             modules_root: root.join("modules"),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let vars = BTreeMap::new();
         let step = crate::parser::Step {
             step_type: "api".to_string(),
@@ -2587,6 +2718,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
         let mut cache = RuntimeCaches::default();
@@ -2690,7 +2822,7 @@ actions:
             modules_root: modules_root.clone(),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let imports = vec![ImportSpec {
             module: "auth".to_string(),
@@ -2716,6 +2848,7 @@ actions:
             r#as: Some("login".to_string()),
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
 
@@ -2791,7 +2924,7 @@ actions:
             modules_root: modules_root.clone(),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let imports = vec![ImportSpec {
             module: "entities".to_string(),
@@ -2813,6 +2946,7 @@ actions:
             r#as: Some("entity".to_string()),
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
 
@@ -2831,6 +2965,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
 
@@ -2898,7 +3033,7 @@ actions:
             modules_root: modules_root.clone(),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         let imports = vec![ImportSpec {
             module: "health".to_string(),
@@ -2920,6 +3055,7 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
 
@@ -2975,7 +3111,7 @@ actions:
             modules_root: modules_root.clone(),
             fixtures_root: root.join("fixtures"),
         };
-        let client = reqwest::Client::new();
+        let client = test_http_runtime();
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         vars.insert("login.token".to_string(), serde_json::json!("existing"));
 
@@ -2999,6 +3135,7 @@ actions:
             r#as: Some("login".to_string()),
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
 
@@ -3081,10 +3218,159 @@ actions:
             r#as: None,
             assertions: Vec::new(),
             condition: None,
+            timeout_ms: None,
             status: None,
         };
         let mut cache = HashMap::new();
         let resolved = resolve_action_steps(&step, &imports, &runtime_paths, &mut cache).expect("resolve action");
         assert_eq!(resolved.required_properties, vec!["postId".to_string()]);
+    }
+
+    /// Accepts connections and then never answers — the exact shape of failure
+    /// that hung a run before there was a timeout.
+    async fn spawn_black_hole() -> u16 {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                // Hold the socket open without writing a response.
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    fn timeout_probe_step(url: String, timeout_ms: Option<u64>) -> crate::parser::Step {
+        crate::parser::Step {
+            step_type: "api".to_string(),
+            id: None,
+            name: "probe".to_string(),
+            method: "GET".to_string(),
+            url,
+            headers: BTreeMap::new(),
+            body: None,
+            body_from_fixture: None,
+            r#ref: None,
+            action: None,
+            properties: BTreeMap::new(),
+            r#as: None,
+            assertions: Vec::new(),
+            condition: None,
+            timeout_ms,
+            status: None,
+        }
+    }
+
+    fn probe_paths(name: &str) -> RuntimePaths {
+        let root = make_tmp_dir(name);
+        RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_timeout_fails_fast_and_names_its_budget() {
+        let port = spawn_black_hole().await;
+        let http = build_http_runtime(
+            &HttpConfig { timeout_ms: Some(300), ..Default::default() },
+            Path::new("."),
+        )
+        .expect("client builds");
+        let step = timeout_probe_step(format!("http://127.0.0.1:{}/hang", port), None);
+        let mut cache = RuntimeCaches::default();
+
+        let started = Instant::now();
+        let result = execute_api_step(
+            &http, &BTreeMap::new(), "", &BTreeMap::new(), &step,
+            &probe_paths("timeout-default"), &mut cache, None,
+        )
+        .await;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(
+            result.message, "timeout: request exceeded 300ms budget",
+            "timeout must name its budget, not surface a generic transport error"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the call must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timeout_narrows_the_client_budget() {
+        let port = spawn_black_hole().await;
+        // A generous client budget that the step overrides downwards.
+        let http = build_http_runtime(
+            &HttpConfig { timeout_ms: Some(30_000), ..Default::default() },
+            Path::new("."),
+        )
+        .expect("client builds");
+        let step = timeout_probe_step(format!("http://127.0.0.1:{}/hang", port), Some(250));
+        let mut cache = RuntimeCaches::default();
+
+        let started = Instant::now();
+        let result = execute_api_step(
+            &http, &BTreeMap::new(), "", &BTreeMap::new(), &step,
+            &probe_paths("timeout-step"), &mut cache, None,
+        )
+        .await;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.message, "timeout: request exceeded 250ms budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the step budget must win over the client's, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_request_is_retried_as_a_network_error() {
+        let port = spawn_black_hole().await;
+        let http = build_http_runtime(&HttpConfig::default(), Path::new(".")).expect("client builds");
+        let step = timeout_probe_step(format!("http://127.0.0.1:{}/hang", port), Some(150));
+        let retry = crate::manifest::RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            delay_ms: 0,
+            backoff: crate::manifest::BackoffStrategy::Fixed,
+            retry_on: crate::manifest::RetryOn { network_errors: true, status_codes: Vec::new() },
+        };
+        let mut cache = RuntimeCaches::default();
+
+        let result = execute_api_step(
+            &http, &BTreeMap::new(), "", &BTreeMap::new(), &step,
+            &probe_paths("timeout-retry"), &mut cache, Some(&retry),
+        )
+        .await;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.attempts_used, Some(3), "a timeout is a retryable network error");
+        assert_eq!(
+            result.message,
+            "timeout: request exceeded 150ms budget after 3 attempt(s)"
+        );
+    }
+
+    #[test]
+    fn default_client_carries_a_bounded_budget() {
+        let http = build_http_runtime(&HttpConfig::default(), Path::new(".")).expect("builds");
+        assert_eq!(http.timeout_ms, crate::manifest::DEFAULT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn unusable_transport_options_are_rejected_at_build_time() {
+        let missing_ca = HttpConfig {
+            ca_file: Some("no/such/ca.pem".to_string()),
+            ..Default::default()
+        };
+        let err = build_http_runtime(&missing_ca, Path::new(".")).expect_err("missing CA must fail");
+        assert!(err.contains("http.caFile"), "unexpected error: {err}");
     }
 }
