@@ -21,9 +21,43 @@ permissions:
   contents: write
 
 jobs:
+  verify-version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'v'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # v1.1.1 shipped a binary that answered `speq 1.0.0`, because nothing tied
+      # the package version to the tag being released. Fail before building
+      # rather than publishing four artifacts that misreport themselves.
+      - name: Compare the package version with the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            tag="${{ github.event.pull_request.head.ref }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          pkg=$(awk '/^\[package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{print;exit}' Cargo.toml \
+                  | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=${tag}  Cargo.toml=${pkg}"
+          if [[ "${tag#v}" != "${pkg}" ]]; then
+            echo "::error::tag ${tag} releases a binary that reports ${pkg}; bump Cargo.toml and Cargo.lock to ${tag#v}"
+            exit 1
+          fi
+
   build-assets:
     name: build ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    needs: verify-version
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
