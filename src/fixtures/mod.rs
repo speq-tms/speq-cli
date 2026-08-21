@@ -31,7 +31,7 @@ pub fn load_fixture(path: &Path) -> Result<FixtureConfig, String> {
             e
         )
     })?;
-    let parsed = serde_yaml::from_str::<FixtureFile>(&content).map_err(|e| {
+    let parsed = crate::secrets::parse_and_resolve::<FixtureFile, _>(&content, &path.display().to_string(), |e| {
         format!(
             "fixture_resolution_error: invalid fixture structure in {}: {}",
             path.display(),

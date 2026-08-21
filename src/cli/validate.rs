@@ -78,7 +78,11 @@ fn validate_environment_files(environments_root: &Path) -> Vec<String> {
     }
     for file in collect_yaml_files(environments_root) {
         match fs::read_to_string(&file) {
-            Ok(content) => match serde_yaml::from_str::<EnvHttpProbe>(&content) {
+            Ok(content) => match crate::secrets::parse_and_resolve::<EnvHttpProbe, _>(
+                &content,
+                &file.display().to_string(),
+                |e| format!("invalid env yaml {}: {e}", file.display()),
+            ) {
                 Ok(probe) => {
                     if let Some(http) = probe.http {
                         if let Err(e) = http.validate(&file.display().to_string()) {

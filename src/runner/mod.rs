@@ -473,8 +473,11 @@ fn load_module_spec(
     }
     let candidates = module_path_candidates(&runtime_paths.modules_root, module_name);
     let (path, content) = read_first_existing_file(&candidates, "module")?;
-    let parsed = serde_yaml::from_str::<ModuleSpec>(&content)
-        .map_err(|e| format!("invalid module yaml {}: {e}", path.display()))?;
+    let parsed = crate::secrets::parse_and_resolve::<ModuleSpec, _>(
+        &content,
+        &path.display().to_string(),
+        |e| format!("invalid module yaml {}: {e}", path.display()),
+    )?;
     module_cache.insert(module_name.to_string(), parsed.clone());
     Ok(parsed)
 }
@@ -634,9 +637,13 @@ fn resolve_returns_expression(
 const MODULE_TOP_LEVEL_KEYS: [&str; 2] = ["actions", "variables"];
 
 pub fn validate_module_content(content: &str, file_path: &str) -> Vec<String> {
-    let module: ModuleSpec = match serde_yaml::from_str(content) {
+    let module: ModuleSpec = match crate::secrets::parse_and_resolve::<ModuleSpec, _>(
+        content,
+        file_path,
+        |e| format!("invalid module YAML {}: {}", file_path, e),
+    ) {
         Ok(m) => m,
-        Err(e) => return vec![format!("invalid module YAML {}: {}", file_path, e)],
+        Err(e) => return vec![e],
     };
     let mut errors = Vec::new();
 

@@ -308,8 +308,9 @@ pub(crate) fn validate_step(step: &Step, file_path: &str, idx: usize) -> Result<
 }
 
 pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpec, String> {
-    let parsed = serde_yaml::from_str::<TestSpec>(content)
-        .map_err(|e| format!("YAML parse error in {}: {}", file_path, e))?;
+    let parsed = crate::secrets::parse_and_resolve::<TestSpec, _>(content, file_path, |e| {
+        format!("YAML parse error in {}: {}", file_path, e)
+    })?;
 
     if parsed.id.trim().is_empty() {
         return Err(format!("'id' is required in {}", file_path));
@@ -357,8 +358,9 @@ pub fn parse_and_validate_test(content: &str, file_path: &str) -> Result<TestSpe
 }
 
 pub fn parse_reusable_steps(content: &str, file_path: &str) -> Result<Vec<Step>, String> {
-    let parsed = serde_yaml::from_str::<ReusableSpec>(content)
-        .map_err(|e| format!("YAML parse error in {}: {}", file_path, e))?;
+    let parsed = crate::secrets::parse_and_resolve::<ReusableSpec, _>(content, file_path, |e| {
+        format!("YAML parse error in {}: {}", file_path, e)
+    })?;
     if parsed.steps.is_empty() {
         return Err(format!("'steps' is required in reusable file {}", file_path));
     }
@@ -375,8 +377,9 @@ pub fn parse_reusable_steps(content: &str, file_path: &str) -> Result<Vec<Step>,
 }
 
 pub fn parse_and_validate_suite_init(content: &str, file_path: &str) -> Result<SuiteInitSpec, String> {
-    let parsed = serde_yaml::from_str::<SuiteInitSpec>(content)
-        .map_err(|e| format!("YAML parse error in {}: {}", file_path, e))?;
+    let parsed = crate::secrets::parse_and_resolve::<SuiteInitSpec, _>(content, file_path, |e| {
+        format!("YAML parse error in {}: {}", file_path, e)
+    })?;
 
     for (import_idx, import) in parsed.suite.imports.iter().enumerate() {
         if import.module.trim().is_empty() {
