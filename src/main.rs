@@ -111,7 +111,9 @@ async fn main() {
     match result {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("{err}");
+            // A load-time error can quote the value it failed on, so it goes
+            // through the same redaction as every report.
+            eprintln!("{}", speq_cli::secrets::redact(&err));
             if err.starts_with("internal:") {
                 std::process::exit(EXIT_INTERNAL);
             }

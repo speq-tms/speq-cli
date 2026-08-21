@@ -157,8 +157,10 @@ fn read_env_config(
         .join(format!("{}.yaml", env_name));
     let content = fs::read_to_string(&env_path)
         .map_err(|e| format!("failed to read env file {}: {e}", env_path.display()))?;
-    let parsed = serde_yaml::from_str::<EnvYaml>(&content)
-        .map_err(|e| format!("invalid env yaml {}: {e}", env_path.display()))?;
+    let env_label = env_path.display().to_string();
+    let parsed = crate::secrets::parse_and_resolve::<EnvYaml, _>(&content, &env_label, |e| {
+        format!("invalid env yaml {}: {e}", env_path.display())
+    })?;
 
     let base_url = parsed.base_url.unwrap_or_default();
     let mut vars = BTreeMap::new();
@@ -369,11 +371,12 @@ fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(value).map_err(|e| format!("internal: failed to encode json: {e}"))?;
-    fs::write(path, body).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(path, crate::secrets::redact(&body))
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn write_attachment_text(allure_dir: &Path, source: &str, content: &str) -> Result<(), String> {
-    fs::write(allure_dir.join(source), content)
+    fs::write(allure_dir.join(source), crate::secrets::redact(content))
         .map_err(|e| format!("failed to write attachment {}: {e}", allure_dir.join(source).display()))
 }
 
@@ -1103,7 +1106,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
+        crate::secrets::redact(&serde_json::to_string_pretty(&json!({
           "ok": failed == 0 && error_count == 0 && !coverage_exit_failure,
           "status": status,
           "totals": {
@@ -1118,7 +1121,7 @@ pub async fn command_run(options: RunOptions) -> Result<i32, String> {
             "allure": if allure_generated { Some(allure_dir.to_string_lossy().to_string()) } else { None::<String> }
           }
         }))
-        .map_err(|e| format!("internal: failed to encode json: {e}"))?
+        .map_err(|e| format!("internal: failed to encode json: {e}"))?)
     );
 
     Ok(if failed == 0 && error_count == 0 && !coverage_exit_failure { 0 } else { 1 })

@@ -226,8 +226,10 @@ pub fn read_manifest(speq_root: &Path) -> Result<Manifest, String> {
     let manifest_path = speq_root.join("manifest.yaml");
     let content = fs::read_to_string(&manifest_path)
         .map_err(|e| format!("failed to read manifest {}: {e}", manifest_path.display()))?;
-    let parsed = serde_yaml::from_str::<Manifest>(&content)
-        .map_err(|e| format!("invalid manifest {}: {e}", manifest_path.display()))?;
+    let label = manifest_path.display().to_string();
+    let parsed = crate::secrets::parse_and_resolve::<Manifest, _>(&content, &label, |e| {
+        format!("invalid manifest {}: {e}", manifest_path.display())
+    })?;
 
     if parsed.version.trim() != "1" {
         return Err(format!(
