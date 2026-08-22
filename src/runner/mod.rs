@@ -716,18 +716,125 @@ pub fn validate_module_content(content: &str, file_path: &str) -> Vec<String> {
     errors
 }
 
+/// The key of a string that is *nothing but* one `{{ … }}` placeholder.
+///
+/// This is what lets an assertion keep the bound value's type: an expected of
+/// `"{{created.response.body.id}}"` is the id itself, while `"id-{{n}}"` can
+/// only ever be text.
+fn sole_placeholder(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    let inner = trimmed.strip_prefix("{{")?.strip_suffix("}}")?;
+    if inner.contains("{{") || inner.contains("}}") {
+        return None;
+    }
+    Some(inner.trim())
+}
+
+/// Renders an `assert.expected`, preserving the bound value's type.
+///
+/// Structure is walked the same way `render_template_in_value` walks a body.
+/// The difference is the whole-string case: a body field is always text on the
+/// wire, but an assertion compares against parsed JSON, so
+/// `{{created.response.body.id}}` has to compare as the number `101` and not
+/// as the string `"101"`.
+///
+/// An unbound placeholder is deliberately left intact rather than blanked, so
+/// the caller can report it instead of comparing against a literal `{{…}}`.
+fn render_expected_value(value: &Value, vars: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(s) => match sole_placeholder(s) {
+            Some(key) => match lookup_var(vars, key) {
+                Some(bound) => bound,
+                None => value.clone(),
+            },
+            None => Value::String(render_template(s, vars)),
+        },
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), render_expected_value(v, vars)))
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| render_expected_value(v, vars)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The first placeholder left unresolved anywhere in a rendered `expected`.
+fn first_unresolved_in_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => find_unresolved_placeholder(s),
+        Value::Object(map) => map.values().find_map(first_unresolved_in_value),
+        Value::Array(items) => items.iter().find_map(first_unresolved_in_value),
+        _ => None,
+    }
+}
+
+/// One-line rendering of the template an expectation was written as.
+fn compact_json(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Appends the template a failed expectation came from, so a wrong capture is
+/// diagnosable from the message alone rather than by re-reading the spec.
+fn with_template_source(message: String, source: &Option<String>) -> String {
+    match source {
+        Some(template) => format!("{message} (expected rendered from {template})"),
+        None => message,
+    }
+}
+
 fn run_assertions(
     assertions: &[Assertion],
     status: u16,
     body: &str,
     runtime_paths: &RuntimePaths,
     schema_cache: &mut HashMap<String, JSONSchema>,
+    vars: &BTreeMap<String, Value>,
 ) -> (Vec<AssertionRunResult>, Vec<String>) {
     let mut details = Vec::new();
     let mut errors = Vec::new();
     let parsed_json = serde_json::from_str::<Value>(body).ok();
 
-    for assertion in assertions {
+    for (idx, assertion) in assertions.iter().enumerate() {
+        // `expected` is rendered against the same scope as the step's url and
+        // body, which is what makes create -> read -> compare expressible.
+        // `schema` is untouched: its 'ref' and 'inline' are a location and a
+        // schema, not a compared value.
+        let rendered = assertion
+            .expected
+            .as_ref()
+            .map(|raw| render_expected_value(raw, vars));
+        let template_source = match (&assertion.expected, &rendered) {
+            (Some(raw), Some(out)) if raw != out => Some(compact_json(raw)),
+            _ => None,
+        };
+        if let Some(unresolved) = rendered.as_ref().and_then(first_unresolved_in_value) {
+            let message = format!(
+                "unresolved_template: '{}' in assert[{}] of this step is not bound to any variable",
+                unresolved, idx
+            );
+            errors.push(message.clone());
+            details.push(AssertionRunResult {
+                assertion_type: assertion.assertion_type.clone(),
+                status: "failed".to_string(),
+                message,
+                path: assertion.path.clone(),
+                expected: assertion.expected.clone(),
+            });
+            continue;
+        }
+        let assertion = &Assertion {
+            expected: rendered,
+            ..assertion.clone()
+        };
+        let details_before = details.len();
+        let errors_before = errors.len();
+
         match assertion.assertion_type.as_str() {
             "status" => {
                 let expected = assertion
@@ -1029,6 +1136,19 @@ fn run_assertions(
                 });
             }
         }
+
+        // Naming the template once here keeps every branch's message intact
+        // while still showing where a wrong expectation came from.
+        if template_source.is_some() {
+            for detail in details.iter_mut().skip(details_before) {
+                if detail.status == "failed" {
+                    detail.message = with_template_source(detail.message.clone(), &template_source);
+                }
+            }
+            for error in errors.iter_mut().skip(errors_before) {
+                *error = with_template_source(error.clone(), &template_source);
+            }
+        }
     }
     (details, errors)
 }
@@ -1313,7 +1433,7 @@ async fn execute_api_step(
                     if check_condition(condition, &body) {
                         // Condition met — run assertions and return
                         let (assertion_results, assertion_errors) = run_assertions(
-                            &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                            &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache, vars,
                         );
                         let wait_duration = waiter_start.elapsed().as_millis() as u64;
                         return StepRunResult {
@@ -1377,7 +1497,7 @@ async fn execute_api_step(
 
                 // No condition — run assertions and return
                 let (assertion_results, assertion_errors) = run_assertions(
-                    &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache,
+                    &step.assertions, status, &body, runtime_paths, &mut cache.schema_cache, vars,
                 );
                 let attempts_field = if total_attempts > 1 { Some(total_attempts) } else { None };
                 return if assertion_errors.is_empty() {
@@ -2237,7 +2357,7 @@ mod tests {
             inline: None,
         }];
         let mut cache = HashMap::new();
-        let (_details, errors) = run_assertions(&assertions, 200, r#"{"id":1}"#, &runtime_paths, &mut cache);
+        let (_details, errors) = run_assertions(&assertions, 200, r#"{"id":1}"#, &runtime_paths, &mut cache, &BTreeMap::new());
         assert!(errors.is_empty());
     }
 
@@ -2260,7 +2380,7 @@ mod tests {
             })),
         }];
         let mut cache = HashMap::new();
-        let (_details, errors) = run_assertions(&assertions, 200, r#"{"id":1}"#, &runtime_paths, &mut cache);
+        let (_details, errors) = run_assertions(&assertions, 200, r#"{"id":1}"#, &runtime_paths, &mut cache, &BTreeMap::new());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("schema assertion failed"));
     }
@@ -3379,5 +3499,209 @@ actions:
         };
         let err = build_http_runtime(&missing_ca, Path::new(".")).expect_err("missing CA must fail");
         assert!(err.contains("http.caFile"), "unexpected error: {err}");
+    }
+
+    /// The scope a step sees after a previous step bound its response by id.
+    fn captured_vars() -> BTreeMap<String, Value> {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "created".to_string(),
+            serde_json::json!({
+                "response": {
+                    "status": 201,
+                    "body": { "id": 101, "title": "hello", "done": false, "tags": ["a", "b"] },
+                    "headers": { "location": "/posts/101" }
+                }
+            }),
+        );
+        vars.insert("suiteTitle".to_string(), Value::String("hello".to_string()));
+        vars
+    }
+
+    fn assert_json(path: &str, expected: Value) -> Assertion {
+        Assertion {
+            assertion_type: "json".to_string(),
+            path: Some(path.to_string()),
+            expected: Some(expected),
+            r#ref: None,
+            inline: None,
+        }
+    }
+
+    fn run_asserts(assertions: &[Assertion], body: &str) -> (Vec<AssertionRunResult>, Vec<String>) {
+        let root = make_tmp_dir("assert-tpl");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let mut cache = HashMap::new();
+        run_assertions(assertions, 200, body, &runtime_paths, &mut cache, &captured_vars())
+    }
+
+    #[test]
+    fn a_captured_number_compares_as_a_number() {
+        let assertions = vec![assert_json(
+            "$.postId",
+            Value::String("{{created.response.body.id}}".to_string()),
+        )];
+        let (details, errors) = run_asserts(&assertions, r#"{"postId":101}"#);
+
+        assert!(
+            errors.is_empty(),
+            "create -> read -> compare must match on type, got: {errors:?}"
+        );
+        assert_eq!(
+            details[0].expected,
+            Some(Value::Number(101.into())),
+            "the placeholder must resolve to the number, not the string \"101\""
+        );
+    }
+
+    #[test]
+    fn a_captured_boolean_keeps_its_type() {
+        let assertions = vec![assert_json(
+            "$.done",
+            Value::String("{{created.response.body.done}}".to_string()),
+        )];
+        let (_details, errors) = run_asserts(&assertions, r#"{"done":false}"#);
+        assert!(errors.is_empty(), "expected a boolean comparison, got: {errors:?}");
+    }
+
+    #[test]
+    fn a_placeholder_inside_text_still_renders_as_text() {
+        let assertions = vec![assert_json(
+            "$.slug",
+            Value::String("post-{{created.response.body.id}}".to_string()),
+        )];
+        let (_details, errors) = run_asserts(&assertions, r#"{"slug":"post-101"}"#);
+        assert!(errors.is_empty(), "expected string interpolation, got: {errors:?}");
+    }
+
+    #[test]
+    fn nested_expected_structures_render_element_wise() {
+        let assertions = vec![assert_json(
+            "$.echo",
+            serde_json::json!({
+                "id": "{{created.response.body.id}}",
+                "labels": ["{{created.response.body.title}}", "static"],
+                "meta": { "location": "{{created.response.headers.location}}" }
+            }),
+        )];
+        let (_details, errors) = run_asserts(
+            &assertions,
+            r#"{"echo":{"id":101,"labels":["hello","static"],"meta":{"location":"/posts/101"}}}"#,
+        );
+        assert!(errors.is_empty(), "expected element-wise rendering, got: {errors:?}");
+    }
+
+    #[test]
+    fn a_templated_status_assertion_resolves() {
+        let assertions = vec![Assertion {
+            assertion_type: "status".to_string(),
+            path: None,
+            expected: Some(Value::String("{{created.response.status}}".to_string())),
+            r#ref: None,
+            inline: None,
+        }];
+        let root = make_tmp_dir("assert-status");
+        let runtime_paths = RuntimePaths {
+            schemas_root: root.join("schemas"),
+            modules_root: root.join("modules"),
+            fixtures_root: root.join("fixtures"),
+        };
+        let mut cache = HashMap::new();
+        let (_details, errors) =
+            run_assertions(&assertions, 201, "{}", &runtime_paths, &mut cache, &captured_vars());
+        assert!(errors.is_empty(), "expected 201 to match the captured status, got: {errors:?}");
+    }
+
+    #[test]
+    fn contains_and_regex_render_their_expected() {
+        let assertions = vec![
+            Assertion {
+                assertion_type: "contains".to_string(),
+                path: None,
+                expected: Some(Value::String("{{created.response.body.title}}".to_string())),
+                r#ref: None,
+                inline: None,
+            },
+            Assertion {
+                assertion_type: "regex".to_string(),
+                path: None,
+                expected: Some(Value::String("^\\{\"t\":\"{{suiteTitle}}\"\\}$".to_string())),
+                r#ref: None,
+                inline: None,
+            },
+        ];
+        let (_details, errors) = run_asserts(&assertions, r#"{"t":"hello"}"#);
+        assert!(errors.is_empty(), "expected both to render, got: {errors:?}");
+    }
+
+    #[test]
+    fn an_unbound_placeholder_in_expected_is_an_error() {
+        let assertions = vec![assert_json(
+            "$.id",
+            Value::String("{{nosuch.response.body.id}}".to_string()),
+        )];
+        let (details, errors) = run_asserts(&assertions, r#"{"id":101}"#);
+
+        assert_eq!(errors.len(), 1, "an unbound placeholder must not compare as a literal");
+        assert!(
+            errors[0].starts_with("unresolved_template:"),
+            "must match the rule used for url and body: {}",
+            errors[0]
+        );
+        assert!(errors[0].contains("{{nosuch.response.body.id}}"), "{}", errors[0]);
+        assert_eq!(details[0].status, "failed");
+    }
+
+    #[test]
+    fn a_failed_templated_expectation_names_its_template() {
+        let assertions = vec![assert_json(
+            "$.postId",
+            Value::String("{{created.response.body.id}}".to_string()),
+        )];
+        let (details, errors) = run_asserts(&assertions, r#"{"postId":999}"#);
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("expected 101") && errors[0].contains("got 999"),
+            "the resolved value must be visible: {}",
+            errors[0]
+        );
+        assert!(
+            errors[0].contains("{{created.response.body.id}}"),
+            "the template must be visible too, so a wrong capture is diagnosable: {}",
+            errors[0]
+        );
+        assert_eq!(details[0].status, "failed");
+    }
+
+    #[test]
+    fn an_untemplated_failure_message_is_unchanged() {
+        let assertions = vec![assert_json("$.postId", Value::Number(7.into()))];
+        let (_details, errors) = run_asserts(&assertions, r#"{"postId":999}"#);
+        assert_eq!(
+            errors[0], "json assertion failed at '$.postId': expected 7, got 999",
+            "a literal expectation gains no template suffix"
+        );
+    }
+
+    #[test]
+    fn a_schema_assertion_ignores_the_variable_scope() {
+        let assertions = vec![Assertion {
+            assertion_type: "schema".to_string(),
+            path: None,
+            expected: None,
+            r#ref: None,
+            inline: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "integer" } },
+                "required": ["id"]
+            })),
+        }];
+        let (_details, errors) = run_asserts(&assertions, r#"{"id":101}"#);
+        assert!(errors.is_empty(), "schema assertions are untouched: {errors:?}");
     }
 }
